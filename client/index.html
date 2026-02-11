@@ -1,12 +1,104 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>YOINK</title>
-  </head>
-  <body class="bg-neutral-950 text-neutral-100">
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YOINK</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; max-width: 720px; margin: 0 auto; }
+    input, button { padding: 10px; font-size: 16px; }
+    .row { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+    pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>YOINK (Lobby)</h1>
+
+  <div class="row">
+    <input id="name" placeholder="Nickname" />
+  </div>
+
+  <div class="row">
+    <button onclick="createRoom()">Create Room</button>
+    <input id="code" placeholder="Room Code" style="text-transform: uppercase;" />
+    <button onclick="joinRoom()">Join Room</button>
+  </div>
+
+  <div class="row">
+    <button onclick="leaveRoom()">Leave Room</button>
+  </div>
+
+  <h3>Room State</h3>
+  <pre id="output">Not connected yet…</pre>
+
+  <script>
+    const SERVER_URL = "https://yoink-j9pd.onrender.com";
+
+    // Render free tier may “sleep”; first connection can take a few seconds.
+    const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
+
+    const output = document.getElementById("output");
+    const codeInput = document.getElementById("code");
+    const nameInput = document.getElementById("name");
+
+    function log(obj) {
+      output.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    socket.on("connect", () => log({ status: "connected", socketId: socket.id, server: SERVER_URL }));
+    socket.on("connect_error", (err) => log({ status: "connect_error", message: err?.message, server: SERVER_URL }));
+
+    // These event names must match your server.
+    // If your server uses ROOM_STATE instead of roomUpdate, tell me and I’ll adjust instantly.
+    socket.on("roomUpdate", (room) => log(room));
+    socket.on("ROOM_STATE", (room) => log(room));
+
+    function createRoom() {
+      const nickname = nameInput.value.trim();
+      if (!nickname) return alert("Enter a nickname first");
+
+      // Try both naming conventions (depending on which server version you deployed)
+      socket.emit("createRoom", { nickname }, (res) => {
+        if (res?.ok) {
+          codeInput.value = res.code;
+          alert("Room Code: " + res.code);
+        } else {
+          // fallback
+          socket.emit("ROOM_CREATE", { nickname }, (res2) => {
+            if (res2?.ok) {
+              codeInput.value = res2.code;
+              alert("Room Code: " + res2.code);
+            } else {
+              alert("Create room failed. Tell me what your server expects for event names.");
+            }
+          });
+        }
+      });
+    }
+
+    function joinRoom() {
+      const nickname = nameInput.value.trim();
+      const code = codeInput.value.trim().toUpperCase();
+      if (!nickname) return alert("Enter a nickname first");
+      if (code.length < 4) return alert("Enter a 4-letter room code");
+
+      socket.emit("joinRoom", { code, nickname }, (res) => {
+        if (res?.ok) return;
+        socket.emit("ROOM_JOIN", { code, nickname }, (res2) => {
+          if (!res2?.ok) alert(res2?.reason ?? "Join failed");
+        });
+      });
+    }
+
+    function leaveRoom() {
+      const code = codeInput.value.trim().toUpperCase();
+      if (!code) return;
+
+      socket.emit("ROOM_LEAVE", { code });
+      socket.emit("leaveRoom", { code });
+      log({ status: "left_room", code });
+    }
+  </script>
+</body>
 </html>
