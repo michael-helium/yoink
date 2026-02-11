@@ -6,14 +6,14 @@ const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
-
 const io = new Server(server, { cors: { origin: "*" } });
 
 app.get("/", (_req, res) => res.send("Yoink server running"));
 
 /** ---------- Config ---------- */
 const ROUND_MS = 60000;
-const BANK_LIMIT = 10; // bumped from spec for playtesting
+const BANK_LIMIT = 10; // playtesting
+const SPAWN_TICK_MS = 600; // how often we check if we should spawn
 
 /** ---------- Dictionary ---------- */
 function loadDictionary() {
@@ -55,7 +55,7 @@ function scoreWord(word) {
   return Math.round(base * lengthBonus);
 }
 
-/** ---------- Letter bag (simple weighted-ish) ---------- */
+/** ---------- Letter bag ---------- */
 const LETTER_BAG = [
   ..."AAAAAAA", ..."EEEEEEEE", ..."IIIIIII", ..."OOOOOO",
   ..."NNNNN", ..."RRRRR", ..."TTTTT", ..."SSSS", ..."LLL",
@@ -73,14 +73,15 @@ function makeId() {
 function makeCode() {
   return Math.random().toString(36).substring(2, 6).toUpperCase();
 }
+function makeTile() {
+  const letter = randFrom(LETTER_BAG);
+  return { id: makeId(), letter, value: letterValue(letter) };
+}
 
 /** Pool is ALWAYS 16 slots. Empty slots are null. */
 function createPool16FixedSlots() {
   const pool = new Array(16).fill(null);
-  for (let i = 0; i < 16; i++) {
-    const letter = randFrom(LETTER_BAG);
-    pool[i] = { id: makeId(), letter, value: letterValue(letter) };
-  }
+  for (let i = 0; i < 16; i++) pool[i] = makeTile();
   return pool;
 }
 
@@ -89,6 +90,47 @@ const rooms = {};
 
 function emitRoom(code) {
   io.to(code).emit("roomUpdate", rooms[code]);
+}
+
+function poolCount(room) {
+  return (room.pool || []).filter(Boolean).length;
+}
+
+function maybeSpawn(room) {
+  if (room.state !== "ROUND_ACTIVE") return;
+
+  const count = poolCount(room);
+  const fullness = count / 16; // 1.0 full, 0.0 empty
+
+  // Spawn probability increases as pool empties:
+  // full -> ~10% chance per tick
+  // empty -> ~85% chance per tick
+  const spawnChance = 0.10 + (0.75 * (1 - fullness));
+
+  if (Math.random() > spawnChance) return;
+
+  // Find an empty slot and fill it (keeps positions fixed)
+  const emptyIndexes = [];
+  for (let i = 0; i < 16; i++) if (!room.pool[i]) emptyIndexes.push(i);
+  if (emptyIndexes.length === 0) return;
+
+  const idx = emptyIndexes[Math.floor(Math.random() * emptyIndexes.length)];
+  room.pool[idx] = makeTile();
+}
+
+function startSpawnLoop(room) {
+  stopSpawnLoop(room);
+  room.spawnInterval = setInterval(() => {
+    // room could be deleted
+    if (!rooms[room.code]) return;
+    maybeSpawn(room);
+    emitRoom(room.code);
+  }, SPAWN_TICK_MS);
+}
+
+function stopSpawnLoop(room) {
+  if (room.spawnInterval) clearInterval(room.spawnInterval);
+  room.spawnInterval = null;
 }
 
 io.on("connection", (socket) => {
@@ -101,7 +143,8 @@ io.on("connection", (socket) => {
       state: "LOBBY",
       players: {},
       roundEndTime: null,
-      pool: new Array(16).fill(null)
+      pool: new Array(16).fill(null),
+      spawnInterval: null
     };
 
     rooms[code].players[socket.id] = {
@@ -136,14 +179,16 @@ io.on("connection", (socket) => {
     room.roundEndTime = Date.now() + ROUND_MS;
     room.pool = createPool16FixedSlots();
 
-    // Reset banks for now
     Object.values(room.players).forEach((p) => (p.bank = []));
+
+    startSpawnLoop(room);
 
     emitRoom(code);
     callback?.({ ok: true });
 
     setTimeout(() => {
       if (!rooms[code]) return;
+      stopSpawnLoop(room);
       room.state = "LOBBY";
       room.roundEndTime = null;
       room.pool = new Array(16).fill(null);
@@ -163,12 +208,11 @@ io.on("connection", (socket) => {
       return callback?.({ ok: false, reason: "BANK_FULL" });
     }
 
-    // ✅ Find tile in fixed pool; do NOT splice (keep position)
     const idx = room.pool.findIndex((t) => t && t.id === tileId);
     if (idx === -1) return callback?.({ ok: false, reason: "TILE_GONE" });
 
     const tile = room.pool[idx];
-    room.pool[idx] = null; // hole stays in same slot
+    room.pool[idx] = null; // keep position
     player.bank.push(tile);
 
     emitRoom(code);
@@ -186,7 +230,6 @@ io.on("connection", (socket) => {
     const ids = Array.isArray(tileIds) ? tileIds : [];
     if (ids.length < 2) return callback?.({ ok: false, reason: "TOO_SHORT" });
 
-    // Gather tiles by id from bank (duplicates handled correctly)
     const tiles = [];
     for (const id of ids) {
       const t = player.bank.find((x) => x.id === id);
@@ -196,13 +239,11 @@ io.on("connection", (socket) => {
 
     const word = tiles.map((t) => t.letter).join("").toUpperCase();
 
-    // Dictionary check
     if (!DICT.has(word)) return callback?.({ ok: false, reason: "NOT_A_WORD", word });
 
     const points = scoreWord(word);
     player.score += points;
 
-    // Remove used tiles from bank
     player.bank = player.bank.filter((t) => !ids.includes(t.id));
 
     emitRoom(code);
@@ -220,6 +261,7 @@ io.on("connection", (socket) => {
       }
 
       if (Object.keys(room.players).length === 0) {
+        stopSpawnLoop(room);
         delete rooms[room.code];
         return;
       }
