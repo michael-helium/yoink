@@ -20,6 +20,7 @@ function makeCode() {
 }
 
 io.on("connection", (socket) => {
+
   socket.on("createRoom", ({ nickname }, callback) => {
     const code = makeCode();
 
@@ -27,7 +28,8 @@ io.on("connection", (socket) => {
       code,
       host: socket.id,
       state: "LOBBY",
-      players: {}
+      players: {},
+      roundEndTime: null
     };
 
     rooms[code].players[socket.id] = {
@@ -36,29 +38,38 @@ io.on("connection", (socket) => {
     };
 
     socket.join(code);
-
     callback({ ok: true, code });
-
     io.to(code).emit("roomUpdate", rooms[code]);
   });
 
   socket.on("joinRoom", ({ code, nickname }, callback) => {
     const room = rooms[code];
+    if (!room) return callback({ ok: false });
 
-    if (!room) {
-      callback({ ok: false });
-      return;
-    }
-
-    room.players[socket.id] = {
-      nickname,
-      score: 0
-    };
-
+    room.players[socket.id] = { nickname, score: 0 };
     socket.join(code);
 
     callback({ ok: true });
     io.to(code).emit("roomUpdate", room);
+  });
+
+  socket.on("startGame", ({ code }) => {
+    const room = rooms[code];
+    if (!room) return;
+    if (room.host !== socket.id) return;
+
+    room.state = "ROUND_ACTIVE";
+    room.roundEndTime = Date.now() + 60000; // 60 seconds
+
+    io.to(code).emit("roomUpdate", room);
+
+    // End round automatically
+    setTimeout(() => {
+      if (!rooms[code]) return;
+      room.state = "LOBBY";
+      room.roundEndTime = null;
+      io.to(code).emit("roomUpdate", room);
+    }, 60000);
   });
 
   socket.on("disconnect", () => {
