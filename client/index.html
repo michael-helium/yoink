@@ -7,92 +7,99 @@
     body { font-family: system-ui; padding: 24px; max-width: 900px; margin: auto; }
     input, button { padding: 10px; margin: 6px 0; }
     .hidden { display: none; }
+    .timer { font-size: 22px; font-weight: 800; color: #c00; margin: 10px 0; }
 
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, 70px);
-      gap: 10px;
-      margin-top: 20px;
-    }
-
+    .grid { display: grid; grid-template-columns: repeat(4, 70px); gap: 10px; margin-top: 14px; }
     .tile {
-      width: 70px;
-      height: 70px;
-      border: 1px solid #ccc;
-      border-radius: 10px;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      font-size: 22px;
-      font-weight: bold;
-      cursor: pointer;
-      background: white;
+      width: 70px; height: 70px; border: 1px solid #ccc; border-radius: 12px;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      font-size: 24px; font-weight: 900; cursor: pointer; background: white;
+      user-select: none;
     }
+    .tile small { font-size: 11px; opacity: 0.6; font-weight: 700; }
 
-    .tile small { font-size: 11px; opacity: 0.6; }
-
-    .bank { display: flex; gap: 8px; margin-top: 20px; }
-
+    .bank { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     .bankTile {
-      width: 40px;
-      height: 40px;
-      border: 1px solid #aaa;
-      border-radius: 8px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      font-weight: bold;
+      width: 44px; height: 44px; border: 1px solid #aaa; border-radius: 10px;
+      display: inline-flex; justify-content: center; align-items: center;
+      font-weight: 900; cursor: pointer; user-select: none; background: #fff;
     }
+    .bankTile.selected { outline: 3px solid #4a90e2; }
 
-    .timer {
-      font-size: 22px;
-      font-weight: bold;
-      color: red;
-      margin-top: 10px;
-    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: #eee; font-weight: 700; }
+    pre { background: #111; color: #0f0; padding: 12px; border-radius: 12px; overflow: auto; }
   </style>
 </head>
 <body>
 
 <h1>YOINK</h1>
 
-<!-- LOBBY SCREEN -->
+<!-- LOBBY -->
 <div id="lobbyScreen">
-  <input id="name" placeholder="Nickname" />
-  <button onclick="createRoom()">Create Room</button>
-  <br/>
-  <input id="code" placeholder="Room Code" />
-  <button onclick="joinRoom()">Join Room</button>
-  <br/>
-  <button onclick="startGame()">Start Game (Host Only)</button>
+  <div class="row">
+    <input id="name" placeholder="Nickname" />
+  </div>
+
+  <div class="row">
+    <button onclick="createRoom()">Create Room</button>
+    <input id="code" placeholder="Room Code" style="text-transform: uppercase;" />
+    <button onclick="joinRoom()">Join Room</button>
+  </div>
+
+  <div class="row">
+    <button onclick="startGame()">Start Game (Host Only)</button>
+  </div>
+
+  <h3>Lobby State</h3>
   <pre id="lobbyOutput"></pre>
 </div>
 
-<!-- GAME SCREEN -->
+<!-- GAME -->
 <div id="gameScreen" class="hidden">
-  <button onclick="leaveGame()">Leave Game</button>
+  <div class="row">
+    <button onclick="leaveGame()">Leave Game</button>
+    <div class="pill" id="scorePill"></div>
+  </div>
+
   <div class="timer" id="timer"></div>
 
-  <h3>Letter Pool</h3>
+  <h3>4×4 Pool (click to yoink)</h3>
   <div class="grid" id="pool"></div>
 
-  <h3>Your Bank (max 7)</h3>
+  <h3>Your Bank (click tiles to build word)</h3>
   <div class="bank" id="bank"></div>
+
+  <div style="margin-top: 14px;">
+    <div class="pill">Word: <span id="currentWord"></span></div>
+  </div>
+
+  <div class="row" style="margin-top: 10px;">
+    <button onclick="submitWord()">Submit</button>
+    <button onclick="clearWord()">Clear</button>
+  </div>
+
+  <div class="row" style="margin-top: 10px;">
+    <div id="result"></div>
+  </div>
 </div>
 
 <script>
 const SERVER_URL = "https://yoink-j9pd.onrender.com";
-const socket = io(SERVER_URL);
+const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
 
 let currentRoom = null;
+let selectedTileIds = [];
 
 const lobbyScreen = document.getElementById("lobbyScreen");
-const gameScreen = document.getElementById("gameScreen");
+const gameScreen  = document.getElementById("gameScreen");
 const poolDiv = document.getElementById("pool");
 const bankDiv = document.getElementById("bank");
 const timerDiv = document.getElementById("timer");
 const lobbyOutput = document.getElementById("lobbyOutput");
+const currentWordSpan = document.getElementById("currentWord");
+const resultDiv = document.getElementById("result");
+const scorePill = document.getElementById("scorePill");
 
 socket.on("roomUpdate", (room) => {
   currentRoom = room;
@@ -116,10 +123,14 @@ function showLobbyScreen() {
   gameScreen.classList.add("hidden");
   lobbyScreen.classList.remove("hidden");
   timerDiv.textContent = "";
+  selectedTileIds = [];
+  currentWordSpan.textContent = "";
+  resultDiv.textContent = "";
 }
 
 function createRoom() {
   const nickname = document.getElementById("name").value.trim();
+  if (!nickname) return alert("Enter a nickname");
   socket.emit("createRoom", { nickname }, (res) => {
     document.getElementById("code").value = res.code;
     alert("Room Code: " + res.code);
@@ -129,55 +140,96 @@ function createRoom() {
 function joinRoom() {
   const nickname = document.getElementById("name").value.trim();
   const code = document.getElementById("code").value.toUpperCase().trim();
+  if (!nickname) return alert("Enter a nickname");
+  if (code.length < 4) return alert("Enter the room code");
   socket.emit("joinRoom", { code, nickname }, (res) => {
-    if (!res.ok) alert("Room not found");
+    if (!res.ok) alert(res.reason || "Room not found");
   });
 }
 
 function startGame() {
-  if (!currentRoom) return;
-  socket.emit("startGame", { code: currentRoom.code });
+  if (!currentRoom) return alert("Join a room first");
+  socket.emit("startGame", { code: currentRoom.code }, (res) => {
+    if (res && !res.ok) alert(res.reason || "Start failed");
+  });
 }
 
 function leaveGame() {
   showLobbyScreen();
 }
 
+function toggleSelect(tileId) {
+  if (selectedTileIds.includes(tileId)) {
+    selectedTileIds = selectedTileIds.filter((id) => id !== tileId);
+  } else {
+    selectedTileIds.push(tileId);
+  }
+  updateCurrentWord();
+  renderGame(currentRoom);
+}
+
+function updateCurrentWord() {
+  const you = currentRoom?.players?.[socket.id];
+  const bank = you?.bank || [];
+  const letters = selectedTileIds.map((id) => bank.find((t) => t.id === id)?.letter || "");
+  currentWordSpan.textContent = letters.join("");
+}
+
+function clearWord() {
+  selectedTileIds = [];
+  updateCurrentWord();
+  renderGame(currentRoom);
+  resultDiv.textContent = "";
+}
+
+function submitWord() {
+  if (!currentRoom) return;
+  if (selectedTileIds.length === 0) return;
+
+  socket.emit("submitWord", { code: currentRoom.code, tileIds: selectedTileIds }, (res) => {
+    if (!res?.ok) {
+      resultDiv.textContent = "Rejected: " + (res?.reason || "unknown");
+      return;
+    }
+    resultDiv.textContent = `Accepted: ${res.word} (+${res.points})`;
+    selectedTileIds = [];
+    updateCurrentWord();
+  });
+}
+
 function renderGame(room) {
+  // Score
+  const you = room.players?.[socket.id];
+  scorePill.textContent = "Score: " + (you?.score ?? 0);
+
+  // Pool
   poolDiv.innerHTML = "";
   const pool = room.pool || [];
-
   for (let i = 0; i < 16; i++) {
     const tile = pool[i];
     const el = document.createElement("div");
     el.className = "tile";
 
     if (!tile) {
-      el.style.opacity = 0.3;
+      el.style.opacity = 0.25;
+      el.style.cursor = "default";
     } else {
       el.innerHTML = tile.letter + "<small>" + tile.value + "</small>";
-      el.onclick = () => {
-        socket.emit("yoinkTile", {
-          code: room.code,
-          tileId: tile.id
-        });
-      };
+      el.onclick = () => socket.emit("yoinkTile", { code: room.code, tileId: tile.id });
     }
-
     poolDiv.appendChild(el);
   }
 
-  const you = room.players?.[socket.id];
+  // Bank
   bankDiv.innerHTML = "";
-
-  if (you?.bank) {
-    you.bank.forEach(t => {
-      const b = document.createElement("div");
-      b.className = "bankTile";
-      b.textContent = t.letter;
-      bankDiv.appendChild(b);
-    });
-  }
+  const bank = you?.bank || [];
+  bank.forEach((t) => {
+    const b = document.createElement("div");
+    b.className = "bankTile" + (selectedTileIds.includes(t.id) ? " selected" : "");
+    b.textContent = t.letter;
+    b.onclick = () => toggleSelect(t.id);
+    bankDiv.appendChild(b);
+  });
 }
 
 let timerInterval = null;
