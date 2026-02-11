@@ -11,6 +11,10 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.get("/", (_req, res) => res.send("Yoink server running"));
 
+/** ---------- Config ---------- */
+const ROUND_MS = 60000;
+const BANK_LIMIT = 10; // bumped from spec for playtesting
+
 /** ---------- Dictionary ---------- */
 function loadDictionary() {
   const filePath = path.join(__dirname, "words.txt");
@@ -29,16 +33,15 @@ function loadDictionary() {
   console.log(`Loaded dictionary words: ${set.size}`);
   return set;
 }
-
 const DICT = loadDictionary();
 
-/** ---------- Scoring (per spec tiers + length bonus) ---------- */
+/** ---------- Scoring tiers ---------- */
 const VALUE_10 = new Set(["A","D","E","G","I","L","N","O","R","S","T","U"]);
 const VALUE_20 = new Set(["B","C","F","H","K","M","P","V","W","Y"]);
 const VALUE_30 = new Set(["J","Q","X","Z"]);
 
 function letterValue(letter) {
-  const L = letter.toUpperCase();
+  const L = (letter || "").toUpperCase();
   if (VALUE_10.has(L)) return 10;
   if (VALUE_20.has(L)) return 20;
   if (VALUE_30.has(L)) return 30;
@@ -48,11 +51,11 @@ function letterValue(letter) {
 function scoreWord(word) {
   const letters = word.split("");
   const base = letters.reduce((sum, l) => sum + letterValue(l), 0);
-  const lengthBonus = 1 + (0.2 * letters.length); // spec :contentReference[oaicite:1]{index=1}
+  const lengthBonus = 1 + (0.2 * letters.length);
   return Math.round(base * lengthBonus);
 }
 
-/** ---------- Letters bag + pool ---------- */
+/** ---------- Letter bag (simple weighted-ish) ---------- */
 const LETTER_BAG = [
   ..."AAAAAAA", ..."EEEEEEEE", ..."IIIIIII", ..."OOOOOO",
   ..."NNNNN", ..."RRRRR", ..."TTTTT", ..."SSSS", ..."LLL",
@@ -61,17 +64,24 @@ const LETTER_BAG = [
   ..."J", ..."Q", ..."X", ..."Z"
 ];
 
-function randFrom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-function makeId() { return Math.random().toString(36).slice(2, 10); }
-function makeCode() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
+function randFrom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+function makeId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+function makeCode() {
+  return Math.random().toString(36).substring(2, 6).toUpperCase();
+}
 
-function createPool16() {
-  const tiles = [];
+/** Pool is ALWAYS 16 slots. Empty slots are null. */
+function createPool16FixedSlots() {
+  const pool = new Array(16).fill(null);
   for (let i = 0; i < 16; i++) {
     const letter = randFrom(LETTER_BAG);
-    tiles.push({ id: makeId(), letter, value: letterValue(letter) });
+    pool[i] = { id: makeId(), letter, value: letterValue(letter) };
   }
-  return tiles;
+  return pool;
 }
 
 /** ---------- Rooms ---------- */
@@ -91,7 +101,7 @@ io.on("connection", (socket) => {
       state: "LOBBY",
       players: {},
       roundEndTime: null,
-      pool: []
+      pool: new Array(16).fill(null)
     };
 
     rooms[code].players[socket.id] = {
@@ -123,10 +133,10 @@ io.on("connection", (socket) => {
     if (Object.keys(room.players).length < 2) return callback?.({ ok: false, reason: "NEED_2_PLAYERS" });
 
     room.state = "ROUND_ACTIVE";
-    room.roundEndTime = Date.now() + 60000;
-    room.pool = createPool16();
+    room.roundEndTime = Date.now() + ROUND_MS;
+    room.pool = createPool16FixedSlots();
 
-    // reset banks each round for now
+    // Reset banks for now
     Object.values(room.players).forEach((p) => (p.bank = []));
 
     emitRoom(code);
@@ -136,9 +146,9 @@ io.on("connection", (socket) => {
       if (!rooms[code]) return;
       room.state = "LOBBY";
       room.roundEndTime = null;
-      room.pool = [];
+      room.pool = new Array(16).fill(null);
       emitRoom(code);
-    }, 60000);
+    }, ROUND_MS);
   });
 
   socket.on("yoinkTile", ({ code, tileId }, callback) => {
@@ -148,19 +158,23 @@ io.on("connection", (socket) => {
 
     const player = room.players[socket.id];
     if (!player) return callback?.({ ok: false, reason: "NOT_IN_ROOM" });
-    if (player.bank.length >= 7) return callback?.({ ok: false, reason: "BANK_FULL" });
 
-    const idx = room.pool.findIndex((t) => t.id === tileId);
+    if (player.bank.length >= BANK_LIMIT) {
+      return callback?.({ ok: false, reason: "BANK_FULL" });
+    }
+
+    // ✅ Find tile in fixed pool; do NOT splice (keep position)
+    const idx = room.pool.findIndex((t) => t && t.id === tileId);
     if (idx === -1) return callback?.({ ok: false, reason: "TILE_GONE" });
 
-    const [tile] = room.pool.splice(idx, 1);
+    const tile = room.pool[idx];
+    room.pool[idx] = null; // hole stays in same slot
     player.bank.push(tile);
 
     emitRoom(code);
     callback?.({ ok: true });
   });
 
-  // ✅ NEW: Submit word by tile IDs + dictionary check
   socket.on("submitWord", ({ code, tileIds }, callback) => {
     const room = rooms[code];
     if (!room) return callback?.({ ok: false, reason: "ROOM_NOT_FOUND" });
@@ -169,26 +183,27 @@ io.on("connection", (socket) => {
     const player = room.players[socket.id];
     if (!player) return callback?.({ ok: false, reason: "NOT_IN_ROOM" });
 
-    // Gather tiles from player bank by id (exact match)
+    const ids = Array.isArray(tileIds) ? tileIds : [];
+    if (ids.length < 2) return callback?.({ ok: false, reason: "TOO_SHORT" });
+
+    // Gather tiles by id from bank (duplicates handled correctly)
     const tiles = [];
-    for (const id of tileIds || []) {
+    for (const id of ids) {
       const t = player.bank.find((x) => x.id === id);
       if (!t) return callback?.({ ok: false, reason: "INVALID_TILES" });
       tiles.push(t);
     }
 
     const word = tiles.map((t) => t.letter).join("").toUpperCase();
-    if (word.length < 2) return callback?.({ ok: false, reason: "TOO_SHORT" });
 
-    // Dictionary validation
+    // Dictionary check
     if (!DICT.has(word)) return callback?.({ ok: false, reason: "NOT_A_WORD", word });
 
-    // Score
     const points = scoreWord(word);
     player.score += points;
 
     // Remove used tiles from bank
-    player.bank = player.bank.filter((t) => !tileIds.includes(t.id));
+    player.bank = player.bank.filter((t) => !ids.includes(t.id));
 
     emitRoom(code);
     callback?.({ ok: true, points, word });
