@@ -4,9 +4,46 @@
   <title>Yoink</title>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <style>
-    body { font-family: system-ui; padding: 24px; max-width: 700px; margin: auto; }
+    body { font-family: system-ui; padding: 24px; max-width: 900px; margin: auto; }
     input, button { padding: 10px; margin: 5px 0; }
-    .timer { font-size: 24px; font-weight: bold; color: red; }
+    .timer { font-size: 22px; font-weight: 700; }
+    .wrap { display: grid; grid-template-columns: 1fr 320px; gap: 18px; align-items: start; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 72px);
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      width: fit-content;
+      background: #fafafa;
+    }
+    .tile {
+      width: 72px; height: 72px;
+      display: flex; flex-direction: column;
+      justify-content: center; align-items: center;
+      border-radius: 12px;
+      border: 1px solid #ccc;
+      cursor: pointer;
+      user-select: none;
+      background: white;
+      font-weight: 800;
+      font-size: 26px;
+    }
+    .tile small { font-size: 12px; font-weight: 600; opacity: 0.7; margin-top: 2px; }
+    .tile:active { transform: scale(0.98); }
+    .panel { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    .bank { display: flex; gap: 8px; flex-wrap: wrap; }
+    .bankTile {
+      width: 44px; height: 44px;
+      display: inline-flex;
+      justify-content: center; align-items: center;
+      border: 1px solid #ccc;
+      border-radius: 10px;
+      font-weight: 800;
+      background: #fff;
+    }
+    pre { background: #111; color: #0f0; padding: 12px; border-radius: 12px; overflow: auto; }
   </style>
 </head>
 <body>
@@ -22,22 +59,38 @@
 
   <div class="timer" id="timer"></div>
 
-  <pre id="output"></pre>
+  <div class="wrap" style="margin-top: 14px;">
+    <div>
+      <h3>4×4 Pool (click a tile to yoink)</h3>
+      <div class="grid" id="pool"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Your Bank (max 7)</h3>
+      <div class="bank" id="bank"></div>
+      <hr />
+      <h3>Room JSON</h3>
+      <pre id="output"></pre>
+    </div>
+  </div>
 
 <script>
 const SERVER_URL = "https://yoink-j9pd.onrender.com";
-const socket = io(SERVER_URL);
+const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
 
 let currentRoom = null;
 
 const output = document.getElementById("output");
 const timerDiv = document.getElementById("timer");
+const poolDiv = document.getElementById("pool");
+const bankDiv = document.getElementById("bank");
 
 socket.on("roomUpdate", (room) => {
   currentRoom = room;
   output.textContent = JSON.stringify(room, null, 2);
+  render(room);
 
-  if (room.state === "ROUND_ACTIVE") {
+  if (room.state === "ROUND_ACTIVE" && room.roundEndTime) {
     startTimer(room.roundEndTime);
   } else {
     timerDiv.textContent = "";
@@ -45,7 +98,7 @@ socket.on("roomUpdate", (room) => {
 });
 
 function createRoom() {
-  const nickname = document.getElementById("name").value;
+  const nickname = document.getElementById("name").value.trim();
   socket.emit("createRoom", { nickname }, (res) => {
     alert("Room Code: " + res.code);
     document.getElementById("code").value = res.code;
@@ -53,8 +106,8 @@ function createRoom() {
 }
 
 function joinRoom() {
-  const nickname = document.getElementById("name").value;
-  const code = document.getElementById("code").value.toUpperCase();
+  const nickname = document.getElementById("name").value.trim();
+  const code = document.getElementById("code").value.toUpperCase().trim();
   socket.emit("joinRoom", { code, nickname }, (res) => {
     if (!res.ok) alert("Room not found");
   });
@@ -65,16 +118,55 @@ function startGame() {
   socket.emit("startGame", { code: currentRoom.code });
 }
 
+function yoink(tileId) {
+  if (!currentRoom) return;
+  socket.emit("yoinkTile", { code: currentRoom.code, tileId }, (res) => {
+    if (!res?.ok) {
+      alert("Yoink failed: " + (res?.reason || "unknown"));
+    }
+  });
+}
+
+function render(room) {
+  // Pool
+  poolDiv.innerHTML = "";
+  const pool = room.pool || [];
+  for (let i = 0; i < 16; i++) {
+    const tile = pool[i];
+    const el = document.createElement("div");
+    el.className = "tile";
+    if (!tile) {
+      el.style.opacity = "0.25";
+      el.style.cursor = "default";
+      el.textContent = "";
+    } else {
+      el.innerHTML = `${tile.letter}<small>${tile.value}</small>`;
+      el.onclick = () => yoink(tile.id);
+    }
+    poolDiv.appendChild(el);
+  }
+
+  // Your bank
+  bankDiv.innerHTML = "";
+  const you = room.players?.[socket.id];
+  const bank = you?.bank || [];
+  bank.forEach((t) => {
+    const b = document.createElement("div");
+    b.className = "bankTile";
+    b.textContent = t.letter;
+    bankDiv.appendChild(b);
+  });
+}
+
+let timerInterval = null;
 function startTimer(endTime) {
-  const interval = setInterval(() => {
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(() => {
     const remaining = Math.max(0, endTime - Date.now());
     const seconds = Math.ceil(remaining / 1000);
     timerDiv.textContent = "Time: " + seconds;
-
-    if (remaining <= 0) {
-      clearInterval(interval);
-    }
-  }, 500);
+    if (remaining <= 0) clearInterval(timerInterval);
+  }, 250);
 }
 </script>
 </body>
