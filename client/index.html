@@ -1,104 +1,81 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>YOINK</title>
+  <title>Yoink</title>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; max-width: 720px; margin: 0 auto; }
-    input, button { padding: 10px; font-size: 16px; }
-    .row { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
-    pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; overflow: auto; }
+    body { font-family: system-ui; padding: 24px; max-width: 700px; margin: auto; }
+    input, button { padding: 10px; margin: 5px 0; }
+    .timer { font-size: 24px; font-weight: bold; color: red; }
   </style>
 </head>
 <body>
-  <h1>YOINK (Lobby)</h1>
+  <h1>YOINK</h1>
 
-  <div class="row">
-    <input id="name" placeholder="Nickname" />
-  </div>
+  <input id="name" placeholder="Nickname" />
+  <button onclick="createRoom()">Create Room</button>
 
-  <div class="row">
-    <button onclick="createRoom()">Create Room</button>
-    <input id="code" placeholder="Room Code" style="text-transform: uppercase;" />
-    <button onclick="joinRoom()">Join Room</button>
-  </div>
+  <input id="code" placeholder="Room Code" />
+  <button onclick="joinRoom()">Join Room</button>
 
-  <div class="row">
-    <button onclick="leaveRoom()">Leave Room</button>
-  </div>
+  <button onclick="startGame()">Start Game (Host Only)</button>
 
-  <h3>Room State</h3>
-  <pre id="output">Not connected yet…</pre>
+  <div class="timer" id="timer"></div>
 
-  <script>
-    const SERVER_URL = "https://yoink-j9pd.onrender.com";
+  <pre id="output"></pre>
 
-    // Render free tier may “sleep”; first connection can take a few seconds.
-    const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
+<script>
+const SERVER_URL = "https://yoink-j9pd.onrender.com";
+const socket = io(SERVER_URL);
 
-    const output = document.getElementById("output");
-    const codeInput = document.getElementById("code");
-    const nameInput = document.getElementById("name");
+let currentRoom = null;
 
-    function log(obj) {
-      output.textContent = JSON.stringify(obj, null, 2);
+const output = document.getElementById("output");
+const timerDiv = document.getElementById("timer");
+
+socket.on("roomUpdate", (room) => {
+  currentRoom = room;
+  output.textContent = JSON.stringify(room, null, 2);
+
+  if (room.state === "ROUND_ACTIVE") {
+    startTimer(room.roundEndTime);
+  } else {
+    timerDiv.textContent = "";
+  }
+});
+
+function createRoom() {
+  const nickname = document.getElementById("name").value;
+  socket.emit("createRoom", { nickname }, (res) => {
+    alert("Room Code: " + res.code);
+    document.getElementById("code").value = res.code;
+  });
+}
+
+function joinRoom() {
+  const nickname = document.getElementById("name").value;
+  const code = document.getElementById("code").value.toUpperCase();
+  socket.emit("joinRoom", { code, nickname }, (res) => {
+    if (!res.ok) alert("Room not found");
+  });
+}
+
+function startGame() {
+  if (!currentRoom) return;
+  socket.emit("startGame", { code: currentRoom.code });
+}
+
+function startTimer(endTime) {
+  const interval = setInterval(() => {
+    const remaining = Math.max(0, endTime - Date.now());
+    const seconds = Math.ceil(remaining / 1000);
+    timerDiv.textContent = "Time: " + seconds;
+
+    if (remaining <= 0) {
+      clearInterval(interval);
     }
-
-    socket.on("connect", () => log({ status: "connected", socketId: socket.id, server: SERVER_URL }));
-    socket.on("connect_error", (err) => log({ status: "connect_error", message: err?.message, server: SERVER_URL }));
-
-    // These event names must match your server.
-    // If your server uses ROOM_STATE instead of roomUpdate, tell me and I’ll adjust instantly.
-    socket.on("roomUpdate", (room) => log(room));
-    socket.on("ROOM_STATE", (room) => log(room));
-
-    function createRoom() {
-      const nickname = nameInput.value.trim();
-      if (!nickname) return alert("Enter a nickname first");
-
-      // Try both naming conventions (depending on which server version you deployed)
-      socket.emit("createRoom", { nickname }, (res) => {
-        if (res?.ok) {
-          codeInput.value = res.code;
-          alert("Room Code: " + res.code);
-        } else {
-          // fallback
-          socket.emit("ROOM_CREATE", { nickname }, (res2) => {
-            if (res2?.ok) {
-              codeInput.value = res2.code;
-              alert("Room Code: " + res2.code);
-            } else {
-              alert("Create room failed. Tell me what your server expects for event names.");
-            }
-          });
-        }
-      });
-    }
-
-    function joinRoom() {
-      const nickname = nameInput.value.trim();
-      const code = codeInput.value.trim().toUpperCase();
-      if (!nickname) return alert("Enter a nickname first");
-      if (code.length < 4) return alert("Enter a 4-letter room code");
-
-      socket.emit("joinRoom", { code, nickname }, (res) => {
-        if (res?.ok) return;
-        socket.emit("ROOM_JOIN", { code, nickname }, (res2) => {
-          if (!res2?.ok) alert(res2?.reason ?? "Join failed");
-        });
-      });
-    }
-
-    function leaveRoom() {
-      const code = codeInput.value.trim().toUpperCase();
-      if (!code) return;
-
-      socket.emit("ROOM_LEAVE", { code });
-      socket.emit("leaveRoom", { code });
-      log({ status: "left_room", code });
-    }
-  </script>
+  }, 500);
+}
+</script>
 </body>
 </html>
