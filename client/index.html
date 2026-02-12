@@ -91,7 +91,7 @@
 
 <script>
 const SERVER_URL = "https://yoink-j9pd.onrender.com";
-const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
+const socket = io(SERVER_URL);
 
 let currentRoom = null;
 let selectedTileIds = [];
