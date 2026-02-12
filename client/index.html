@@ -52,7 +52,7 @@
 
   <div class="row">
     <button onclick="startGame()">Start Game (Host Only)</button>
-    <span class="pill">Bank limit: 10</span>
+    <span class="pill">Bank limit: 7</span>
   </div>
 
   <h3>Lobby State</h3>
@@ -208,7 +208,6 @@ function renderGame(room) {
   const you = room.players?.[socket.id];
   scorePill.textContent = "Score: " + (you?.score ?? 0);
 
-  // Pool (fixed 16 slots; null means empty)
   poolDiv.innerHTML = "";
   const pool = room.pool || [];
   for (let i = 0; i < 16; i++) {
@@ -227,7 +226,6 @@ function renderGame(room) {
     poolDiv.appendChild(el);
   }
 
-  // Bank
   bankDiv.innerHTML = "";
   const bank = you?.bank || [];
   bank.forEach((t) => {
