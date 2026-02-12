@@ -53,6 +53,7 @@
   <div class="row">
     <button onclick="startGame()">Start Game (Host Only)</button>
     <span class="pill">Bank limit: 7</span>
+    <span class="pill" id="hostPill">Host: ?</span>
   </div>
 
   <h3>Lobby State</h3>
@@ -104,10 +105,14 @@ const lobbyOutput = document.getElementById("lobbyOutput");
 const currentWordSpan = document.getElementById("currentWord");
 const resultDiv = document.getElementById("result");
 const scorePill = document.getElementById("scorePill");
+const hostPill = document.getElementById("hostPill");
 
 socket.on("roomUpdate", (room) => {
   currentRoom = room;
   lobbyOutput.textContent = JSON.stringify(room, null, 2);
+
+  const isHost = room.host === socket.id;
+  hostPill.textContent = isHost ? "Host: YOU" : "Host: someone else";
 
   if (room.state === "ROUND_ACTIVE") {
     showGameScreen();
@@ -153,8 +158,11 @@ function joinRoom() {
 
 function startGame() {
   if (!currentRoom) return alert("Join a room first");
+
   socket.emit("startGame", { code: currentRoom.code }, (res) => {
-    if (res && !res.ok) alert(res.reason || "Start failed");
+    if (!res?.ok) {
+      alert("Start failed: " + (res?.reason || "unknown"));
+    }
   });
 }
 
