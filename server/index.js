@@ -12,8 +12,8 @@ app.get("/", (_req, res) => res.send("Yoink server running"));
 
 /** ---------- Config ---------- */
 const ROUND_MS = 60000;
-const BANK_LIMIT = 7;        // ✅ back to spec
-const SPAWN_TICK_MS = 700;   // ✅ every 0.7s fill ONE empty slot (deterministic)
+const BANK_LIMIT = 7;        // ✅ spec
+const SPAWN_TICK_MS = 700;   // fill one empty slot every tick
 
 /** ---------- Dictionary ---------- */
 function loadDictionary() {
@@ -64,21 +64,13 @@ const LETTER_BAG = [
   ..."J", ..."Q", ..."X", ..."Z"
 ];
 
-function randFrom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-function makeId() {
-  return Math.random().toString(36).slice(2, 10);
-}
-function makeCode() {
-  return Math.random().toString(36).substring(2, 6).toUpperCase();
-}
+function randFrom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function makeId() { return Math.random().toString(36).slice(2, 10); }
+function makeCode() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
 function makeTile() {
   const letter = randFrom(LETTER_BAG);
   return { id: makeId(), letter, value: letterValue(letter) };
 }
-
-/** Pool is ALWAYS 16 slots. Empty slots are null. */
 function createPool16FixedSlots() {
   const pool = new Array(16).fill(null);
   for (let i = 0; i < 16; i++) pool[i] = makeTile();
@@ -94,11 +86,8 @@ function emitRoom(code) {
 
 function fillOneEmptySlot(room) {
   if (room.state !== "ROUND_ACTIVE") return;
-
-  // Find FIRST empty slot and fill it (keeps positions fixed)
   const idx = room.pool.findIndex((t) => !t);
-  if (idx === -1) return; // full
-
+  if (idx === -1) return;
   room.pool[idx] = makeTile();
 }
 
@@ -130,11 +119,7 @@ io.on("connection", (socket) => {
       spawnInterval: null
     };
 
-    rooms[code].players[socket.id] = {
-      nickname,
-      score: 0,
-      bank: []
-    };
+    rooms[code].players[socket.id] = { nickname, score: 0, bank: [] };
 
     socket.join(code);
     callback?.({ ok: true, code });
@@ -152,16 +137,27 @@ io.on("connection", (socket) => {
     emitRoom(code);
   });
 
+  // ✅ Always respond with ok/reason so client can display why it failed
   socket.on("startGame", ({ code }, callback) => {
     const room = rooms[code];
     if (!room) return callback?.({ ok: false, reason: "ROOM_NOT_FOUND" });
-    if (room.host !== socket.id) return callback?.({ ok: false, reason: "NOT_HOST" });
-    if (Object.keys(room.players).length < 2) return callback?.({ ok: false, reason: "NEED_2_PLAYERS" });
+
+    if (room.host !== socket.id) {
+      return callback?.({ ok: false, reason: "NOT_HOST" });
+    }
+
+    const playerCount = Object.keys(room.players).length;
+    if (playerCount < 2) {
+      return callback?.({ ok: false, reason: "NEED_2_PLAYERS" });
+    }
+
+    if (room.state === "ROUND_ACTIVE") {
+      return callback?.({ ok: false, reason: "ALREADY_STARTED" });
+    }
 
     room.state = "ROUND_ACTIVE";
     room.roundEndTime = Date.now() + ROUND_MS;
     room.pool = createPool16FixedSlots();
-
     Object.values(room.players).forEach((p) => (p.bank = []));
 
     startSpawnLoop(room);
@@ -195,7 +191,7 @@ io.on("connection", (socket) => {
     if (idx === -1) return callback?.({ ok: false, reason: "TILE_GONE" });
 
     const tile = room.pool[idx];
-    room.pool[idx] = null; // keep position
+    room.pool[idx] = null;
     player.bank.push(tile);
 
     emitRoom(code);
@@ -221,12 +217,10 @@ io.on("connection", (socket) => {
     }
 
     const word = tiles.map((t) => t.letter).join("").toUpperCase();
-
     if (!DICT.has(word)) return callback?.({ ok: false, reason: "NOT_A_WORD", word });
 
     const points = scoreWord(word);
     player.score += points;
-
     player.bank = player.bank.filter((t) => !ids.includes(t.id));
 
     emitRoom(code);
