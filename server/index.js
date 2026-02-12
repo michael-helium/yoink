@@ -12,8 +12,8 @@ app.get("/", (_req, res) => res.send("Yoink server running"));
 
 /** ---------- Config ---------- */
 const ROUND_MS = 60000;
-const BANK_LIMIT = 10; // playtesting
-const SPAWN_TICK_MS = 600; // how often we check if we should spawn
+const BANK_LIMIT = 7;        // ✅ back to spec
+const SPAWN_TICK_MS = 700;   // ✅ every 0.7s fill ONE empty slot (deterministic)
 
 /** ---------- Dictionary ---------- */
 function loadDictionary() {
@@ -92,38 +92,21 @@ function emitRoom(code) {
   io.to(code).emit("roomUpdate", rooms[code]);
 }
 
-function poolCount(room) {
-  return (room.pool || []).filter(Boolean).length;
-}
-
-function maybeSpawn(room) {
+function fillOneEmptySlot(room) {
   if (room.state !== "ROUND_ACTIVE") return;
 
-  const count = poolCount(room);
-  const fullness = count / 16; // 1.0 full, 0.0 empty
+  // Find FIRST empty slot and fill it (keeps positions fixed)
+  const idx = room.pool.findIndex((t) => !t);
+  if (idx === -1) return; // full
 
-  // Spawn probability increases as pool empties:
-  // full -> ~10% chance per tick
-  // empty -> ~85% chance per tick
-  const spawnChance = 0.10 + (0.75 * (1 - fullness));
-
-  if (Math.random() > spawnChance) return;
-
-  // Find an empty slot and fill it (keeps positions fixed)
-  const emptyIndexes = [];
-  for (let i = 0; i < 16; i++) if (!room.pool[i]) emptyIndexes.push(i);
-  if (emptyIndexes.length === 0) return;
-
-  const idx = emptyIndexes[Math.floor(Math.random() * emptyIndexes.length)];
   room.pool[idx] = makeTile();
 }
 
 function startSpawnLoop(room) {
   stopSpawnLoop(room);
   room.spawnInterval = setInterval(() => {
-    // room could be deleted
     if (!rooms[room.code]) return;
-    maybeSpawn(room);
+    fillOneEmptySlot(room);
     emitRoom(room.code);
   }, SPAWN_TICK_MS);
 }
