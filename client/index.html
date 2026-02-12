@@ -7,9 +7,7 @@
     body { font-family: system-ui; padding: 24px; max-width: 900px; margin: auto; }
     input, button { padding: 10px; margin: 6px 0; }
     .hidden { display: none; }
-
     .timer { font-size: 22px; font-weight: 900; color: #c00; margin: 10px 0; }
-
     .grid { display: grid; grid-template-columns: repeat(4, 70px); gap: 10px; margin-top: 14px; }
     .tile {
       width: 70px; height: 70px; border: 1px solid #ccc; border-radius: 12px;
@@ -18,7 +16,6 @@
       user-select: none;
     }
     .tile small { font-size: 11px; opacity: 0.6; font-weight: 700; }
-
     .bank { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
     .bankTile {
       width: 58px; height: 58px; border: 1px solid #aaa; border-radius: 12px;
@@ -27,11 +24,11 @@
       font-size: 22px;
     }
     .bankTile.selected { outline: 3px solid #4a90e2; }
-
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     .pill { padding: 6px 10px; border-radius: 999px; background: #eee; font-weight: 800; }
     #result { font-weight: 900; font-size: 18px; }
     pre { background: #111; color: #0f0; padding: 12px; border-radius: 12px; overflow: auto; }
+    .debug { background:#f6f6f6; border:1px solid #ddd; padding:10px; border-radius:12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   </style>
 </head>
 <body>
@@ -53,8 +50,11 @@
   <div class="row">
     <button onclick="startGame()">Start Game (Host Only)</button>
     <span class="pill">Bank limit: 7</span>
+    <span class="pill" id="connPill">Socket: (starting)</span>
     <span class="pill" id="hostPill">Host: ?</span>
   </div>
+
+  <div class="debug" id="debugLog">debug: page loaded</div>
 
   <h3>Lobby State</h3>
   <pre id="lobbyOutput"></pre>
@@ -106,6 +106,27 @@ const currentWordSpan = document.getElementById("currentWord");
 const resultDiv = document.getElementById("result");
 const scorePill = document.getElementById("scorePill");
 const hostPill = document.getElementById("hostPill");
+const connPill = document.getElementById("connPill");
+const debugLog = document.getElementById("debugLog");
+
+function log(msg) {
+  debugLog.textContent = "debug: " + msg;
+}
+
+socket.on("connect", () => {
+  connPill.textContent = "Socket: connected";
+  log("socket connected, id=" + socket.id);
+});
+
+socket.on("connect_error", (err) => {
+  connPill.textContent = "Socket: ERROR";
+  log("connect_error: " + (err?.message || err));
+});
+
+socket.on("disconnect", (reason) => {
+  connPill.textContent = "Socket: disconnected";
+  log("disconnected: " + reason);
+});
 
 socket.on("roomUpdate", (room) => {
   currentRoom = room;
@@ -140,9 +161,11 @@ function showLobbyScreen() {
 function createRoom() {
   const nickname = document.getElementById("name").value.trim();
   if (!nickname) return alert("Enter a nickname");
+  log("createRoom clicked");
   socket.emit("createRoom", { nickname }, (res) => {
     document.getElementById("code").value = res.code;
     alert("Room Code: " + res.code);
+    log("room created: " + res.code);
   });
 }
 
@@ -151,18 +174,37 @@ function joinRoom() {
   const code = document.getElementById("code").value.toUpperCase().trim();
   if (!nickname) return alert("Enter a nickname");
   if (code.length < 4) return alert("Enter the room code");
+  log("joinRoom clicked: " + code);
   socket.emit("joinRoom", { code, nickname }, (res) => {
-    if (!res.ok) alert(res.reason || "Room not found");
+    if (!res.ok) {
+      alert(res.reason || "Room not found");
+      log("join failed: " + (res.reason || "unknown"));
+    } else {
+      log("joined room: " + code);
+    }
   });
 }
 
 function startGame() {
-  if (!currentRoom) return alert("Join a room first");
+  log("startGame button clicked");
+  if (!currentRoom) {
+    alert("Join a room first");
+    log("startGame blocked: no currentRoom");
+    return;
+  }
 
   socket.emit("startGame", { code: currentRoom.code }, (res) => {
-    if (!res?.ok) {
-      alert("Start failed: " + (res?.reason || "unknown"));
+    if (!res) {
+      alert("No response from server on startGame (server is probably not updated)");
+      log("startGame: no callback response");
+      return;
     }
+    if (!res.ok) {
+      alert("Start failed: " + (res.reason || "unknown"));
+      log("startGame failed: " + (res.reason || "unknown"));
+      return;
+    }
+    log("startGame ok");
   });
 }
 
