@@ -1,12 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { POINTS, scoreWord, scoreBananagramsGrid } from "./lib/scoring";
+import { POINTS, scoreWord, scoreYoinkGrid } from "./lib/scoring";
 
 // ===== Types that mirror server payloads =====
 type ServerState = {
   id: string;
   settings: {
-    gameMode: "yoink" | "bananagrams";
+    gameMode: "classic" | "yoink";
     durationSec: number;
     minLen: number;
     uniqueWords: "disallow" | "allow_no_penalty" | "allow_with_decay";
@@ -16,8 +16,8 @@ type ServerState = {
     dripPerSec: number;
     surgeAtSec: number;
     surgeAmount: number;
-    bananagramsInitialDraw: number;
-    bananagramsDrawSize: number;
+    yoinkInitialDraw: number;
+    yoinkDrawSize: number;
   };
   players: { id: string; name: string; score: number }[];
   pool: Record<string, number>;
@@ -101,12 +101,12 @@ export default function App() {
   const [rejection, setRejection] = useState<string | null>(null);
 
   // ---- Game mode (offline) ----
-  const [gameMode, setGameMode] = useState<"yoink" | "bananagrams">("yoink");
+  const [gameMode, setGameMode] = useState<"classic" | "yoink">("yoink");
 
   // ---- Offline demo round state ----
   const [timeLeft, setTimeLeft] = useState(120);
   const [pool, setPool] = useState<Record<string, number>>({});
-  const [hand, setHand] = useState<Record<string, number>>({}); // bananagrams personal hand
+  const [hand, setHand] = useState<Record<string, number>>({}); // yoink personal hand
   const [revealed, setRevealed] = useState(0);
   const roundTiles = 100;
   const dripPerSec = 2;
@@ -174,7 +174,7 @@ export default function App() {
   }
 
   // ---- Offline demo round control ----
-  // ---- Offline bananagrams: draw from bag into hand ----
+  // ---- Offline yoink: draw from bag into hand ----
   function offlineDrawTiles(count: number) {
     setRevealed((rev) => {
       const bag = bagRef.current;
@@ -206,7 +206,7 @@ export default function App() {
     setTimeLeft(120);
     bagRef.current = makeBag();
 
-    if (gameMode === "bananagrams") {
+    if (gameMode === "yoink") {
       // Deal 21 tiles to hand instantly
       const initial = bagRef.current.slice(0, 21);
       const startHand: Record<string, number> = {};
@@ -301,9 +301,9 @@ export default function App() {
   const tiles = useMemo(() => {
     let src: Record<string, number>;
     if (offlineSim) {
-      src = currentMode === "bananagrams" ? hand : pool;
+      src = currentMode === "yoink" ? hand : pool;
     } else {
-      src = currentMode === "bananagrams" ? (state?.hand || {}) : (state?.pool || {});
+      src = currentMode === "yoink" ? (state?.hand || {}) : (state?.pool || {});
     }
     const arr: string[] = [];
     for (const [ch, count] of Object.entries(src)) {
@@ -325,7 +325,7 @@ export default function App() {
     if (offlineSim) {
       if (w.length < 3) return;
 
-      if (gameMode === "bananagrams") {
+      if (gameMode === "yoink") {
         if (!canConsume(w, hand)) return;
         const pts = w.length * w.length;
         setMyScore((s) => s + pts);
@@ -351,8 +351,8 @@ export default function App() {
     setInput("");
   }
 
-  // ---- BANANAS! handler ----
-  function handleBananas() {
+  // ---- YOINK! handler ----
+  function handleYoink() {
     if (offlineSim) {
       const handCount = Object.values(hand).reduce((s, n) => s + n, 0);
       if (handCount === 0) {
@@ -364,7 +364,7 @@ export default function App() {
       }
       return;
     }
-    sockRef.current?.emit("game:bananas");
+    sockRef.current?.emit("game:yoink");
   }
 
   // ---- DUMP handler ----
@@ -396,7 +396,7 @@ export default function App() {
   const bagRemaining = offlineSim
     ? bagRef.current.length - revealed
     : (state?.bagRemaining ?? 0);
-  const tilesText = currentMode === "bananagrams"
+  const tilesText = currentMode === "yoink"
     ? `Bag: ${bagRemaining} left`
     : offlineSim
       ? `${revealed}/${roundTiles}`
@@ -410,7 +410,7 @@ export default function App() {
       <header className="p-4 border-b border-neutral-800">
         <h1 className="text-2xl font-semibold">YOINK</h1>
         <p className="text-neutral-400 text-sm">
-          {currentMode === "bananagrams" ? "Bananagrams — build your grid!" : "Shared-pool speed word game"}
+          {currentMode === "yoink" ? "YOINK — build your words!" : "Shared-pool speed word game"}
         </p>
 
         {/* Join controls (when not connected and not in offline demo) */}
@@ -450,10 +450,10 @@ export default function App() {
               <select
                 className="w-full mt-1 rounded-xl bg-neutral-800 px-3 py-2 outline-none"
                 value={gameMode}
-                onChange={(e) => setGameMode(e.target.value as "yoink" | "bananagrams")}
+                onChange={(e) => setGameMode(e.target.value as "classic" | "yoink")}
               >
+                <option value="classic">Classic</option>
                 <option value="yoink">Yoink</option>
-                <option value="bananagrams">Bananagrams</option>
               </select>
             </label>
             <button className="rounded-xl bg-amber-500 px-3 py-2 font-semibold" onClick={startOfflineRound}>
@@ -475,8 +475,8 @@ export default function App() {
                 defaultValue={state?.settings.gameMode ?? "yoink"}
                 onChange={(e) => sockRef.current?.emit("settings:update", { gameMode: e.target.value })}
               >
+                <option value="classic">Classic</option>
                 <option value="yoink">Yoink</option>
-                <option value="bananagrams">Bananagrams</option>
               </select>
             </label>
 
@@ -568,7 +568,7 @@ export default function App() {
 
       {/* Pool / Hand tiles */}
       <section className="px-4">
-        {currentMode === "bananagrams" && (
+        {currentMode === "yoink" && (
           <div className="mb-2 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-lg font-bold">🖐️ Hand: {tiles.length} tiles</span>
@@ -608,10 +608,10 @@ export default function App() {
                   ? "bg-yellow-400 text-black animate-pulse"
                   : "bg-neutral-700 text-neutral-400"
               }`}
-              onClick={handleBananas}
+              onClick={handleYoink}
               disabled={tiles.length !== 0 || seconds <= 0}
             >
-              🍌 BANANAS! 🍌
+              🫳 YOINK! 🫳
             </button>
             {offlineSim && (
               <div className="text-xs text-amber-300">⚠️ Offline mode — no dictionary check</div>

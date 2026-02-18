@@ -2,15 +2,15 @@ import express from "express";
 import http from "http";
 import { Server, Socket } from "socket.io";
 import { loadWordlists } from "./dict";
-import { scoreBananagramsGrid, countTiles, BANANAS_BONUS, BANANAS_PENALTY } from "./bananagrams";
+import { scoreYoinkGrid, countTiles, YOINK_BONUS, YOINK_PENALTY } from "./yoink-scoring";
 
 // ===== Types =====
 type UniqueWordsMode = "disallow" | "allow_no_penalty" | "allow_with_decay";
 type DecayModel = "linear" | "soft" | "steep";
-type GameMode = "yoink" | "bananagrams";
+type GameMode = "classic" | "yoink";
 
 type Settings = {
-  gameMode: GameMode;             // default yoink
+  gameMode: GameMode;             // default yoink (personal hand mode)
   durationSec: number;            // 30–600 (default 120)
   minLen: number;                 // 2–6   (default 3)
   uniqueWords: UniqueWordsMode;   // default allow_with_decay
@@ -20,8 +20,8 @@ type Settings = {
   dripPerSec: number;             // default 2
   surgeAtSec: number;             // default 60
   surgeAmount: number;            // default 10 (one-time)
-  bananagramsInitialDraw: number; // tiles dealt to each player at start (default 21)
-  bananagramsDrawSize: number;    // tiles drawn per "peel" request (default 3)
+  yoinkInitialDraw: number; // tiles dealt to each player at start (default 21)
+  yoinkDrawSize: number;    // tiles drawn per "peel" request (default 3)
 };
 
 type Player = {
@@ -29,7 +29,7 @@ type Player = {
   name: string;
   liveScore: number; // score during round (pre-decay)
   words: { word: string; base: number }[];
-  hand: Record<string, number>; // bananagrams personal hand
+  hand: Record<string, number>; // yoink personal hand
 };
 
 type Submission = {
@@ -163,22 +163,22 @@ function publicState(r: RoomState, forSocketId?: string) {
     id: r.id,
     settings: r.settings,
     players: [...r.players.values()].map(p => ({ id: p.id, name: p.name, score: p.liveScore })),
-    pool: r.settings.gameMode === "yoink" ? r.pool : {}, // hide shared pool in bananagrams
+    pool: r.settings.gameMode === "classic" ? r.pool : {}, // hide shared pool in yoink mode
     endsInMs: Math.max(0, (r.endAt ?? Date.now()) - Date.now()),
     revealed: r.revealed,
     roundTiles: r.settings.roundTiles,
-    bagRemaining: r.bag.length - r.revealed, // useful for bananagrams UI
-    hand: forSocketId && r.settings.gameMode === "bananagrams"
+    bagRemaining: r.bag.length - r.revealed, // useful for yoink UI
+    hand: forSocketId && r.settings.gameMode === "yoink"
       ? (r.players.get(forSocketId)?.hand ?? {})
       : undefined
   };
 }
 
 function emitStateToAll(r: RoomState) {
-  if (r.settings.gameMode === "yoink") {
+  if (r.settings.gameMode === "classic") {
     io.to(r.id).emit("lobby:state", publicState(r));
   } else {
-    // bananagrams: each player gets their own hand
+    // yoink: each player gets their own hand
     for (const [sid] of r.players) {
       const s = io.sockets.sockets.get(sid);
       if (s) s.emit("lobby:state", publicState(r, sid));
@@ -220,8 +220,8 @@ function ensureRoom(roomId: string): RoomState {
     dripPerSec: 2,
     surgeAtSec: 60,
     surgeAmount: 10,
-    bananagramsInitialDraw: 21,
-    bananagramsDrawSize: 3
+    yoinkInitialDraw: 21,
+    yoinkDrawSize: 3
   };
 
   r = {
@@ -250,7 +250,7 @@ function drawTiles(r: RoomState, player: Player, count: number): number {
   return take;
 }
 
-/** Check if the bag is exhausted (bananagrams end condition). */
+/** Check if the bag is exhausted (yoink end condition). */
 function isBagEmpty(r: RoomState): boolean {
   return r.revealed >= r.bag.length;
 }
@@ -270,13 +270,13 @@ function startRound(r: RoomState) {
   r.started = true;
   r.endAt = Date.now() + r.settings.durationSec * 1000;
 
-  if (r.settings.gameMode === "bananagrams") {
+  if (r.settings.gameMode === "yoink") {
     // Deal initial hand to each player instantly
     for (const p of r.players.values()) {
-      drawTiles(r, p, r.settings.bananagramsInitialDraw);
+      drawTiles(r, p, r.settings.yoinkInitialDraw);
     }
 
-    // Bananagrams tick: just a timer, no drip. Bag empty does NOT auto-end.
+    // Yoink tick: just a timer, no drip. Bag empty does NOT auto-end.
     r.tick && clearInterval(r.tick);
     r.tick = setInterval(() => {
       const now = Date.now();
@@ -284,7 +284,7 @@ function startRound(r: RoomState) {
         clearInterval(r.tick!);
         r.tick = undefined;
         r.started = false;
-        finalizeBananagramsRound(r);
+        finalizeYoinkRound(r);
         return;
       }
       emitStateToAll(r);
@@ -292,7 +292,7 @@ function startRound(r: RoomState) {
     return;
   }
 
-  // ---- Yoink mode (original) ----
+  // ---- Classic mode (shared pool) ----
   // opening flood (20 tiles)
   const open = Math.min(20, r.settings.roundTiles);
   const opening = r.bag.slice(0, open);
@@ -423,14 +423,14 @@ function finalizeRoundWithDecay(r: RoomState) {
   emitStateToAll(r);
 }
 
-function finalizeBananagramsRound(r: RoomState, bananasWinnerId?: string) {
+function finalizeYoinkRound(r: RoomState, yoinkWinnerId?: string) {
   const final = [...r.players.values()]
     .map(p => {
       const unusedCount = countTiles(p.hand);
       const wordStrs = p.words.map(w => w.word);
-      let finalScore = scoreBananagramsGrid(wordStrs, unusedCount);
-      // liveScore already includes BANANAS_BONUS if applicable
-      if (bananasWinnerId === p.id) finalScore += BANANAS_BONUS;
+      let finalScore = scoreYoinkGrid(wordStrs, unusedCount);
+      // liveScore already includes YOINK_BONUS if applicable
+      if (yoinkWinnerId === p.id) finalScore += YOINK_BONUS;
       return { id: p.id, name: p.name, finalScore };
     })
     .sort((a, b) => b.finalScore - a.finalScore);
@@ -474,8 +474,8 @@ io.on("connection", (socket: Socket) => {
 
     const word = (payload.word || "").toUpperCase();
 
-    if (r.settings.gameMode === "bananagrams") {
-      // Bananagrams: validate & consume from player's personal hand immediately
+    if (r.settings.gameMode === "yoink") {
+      // Yoink: validate & consume from player's personal hand immediately
       const player = r.players.get(playerId);
       if (!player) return;
       if (!/^[A-Z]+$/.test(word)) return;
@@ -493,7 +493,7 @@ io.on("connection", (socket: Socket) => {
       }
 
       consumeWord(word, player.hand);
-      const pts = word.length * word.length; // bananagrams scoring: length²
+      const pts = word.length * word.length; // yoink scoring: length²
       player.words.push({ word, base: pts });
       player.liveScore += pts;
 
@@ -513,32 +513,32 @@ io.on("connection", (socket: Socket) => {
       return;
     }
 
-    // Yoink mode: queue into shadow window
+    // Classic mode: queue into shadow window
     const ts = Date.now();
     const key = nowWindowKey(ts, r.shadowWindowMs);
     if (!r.pending.has(key)) r.pending.set(key, []);
     r.pending.get(key)!.push({ ts, socketId: socket.id, playerId, word });
   });
 
-  // Bananagrams: draw more tiles from the common bag ("peel") — ALL players draw
+  // Yoink: draw more tiles from the common bag ("peel") — ALL players draw
   socket.on("tiles:draw", () => {
     if (!roomId || !playerId) return;
     const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
     if (isBagEmpty(r)) return; // no tiles left
 
     // PEEL: every player in the room draws tiles
     for (const p of r.players.values()) {
-      drawTiles(r, p, r.settings.bananagramsDrawSize);
+      drawTiles(r, p, r.settings.yoinkDrawSize);
     }
     emitStateToAll(r);
   });
 
-  // Bananagrams: dump 1 tile, draw 3 back
+  // Yoink: dump 1 tile, draw 3 back
   socket.on("tiles:dump", (payload: { tile: string }) => {
     if (!roomId || !playerId) return;
     const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
     const player = r.players.get(playerId);
     if (!player) return;
 
@@ -559,26 +559,26 @@ io.on("connection", (socket: Socket) => {
     socket.emit("lobby:state", publicState(r, socket.id));
   });
 
-  // Bananagrams: BANANAS! — declare victory
-  socket.on("game:bananas", () => {
+  // Yoink: YOINK! — declare victory
+  socket.on("game:yoink", () => {
     if (!roomId || !playerId) return;
     const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
     const player = r.players.get(playerId);
     if (!player) return;
 
     const handCount = countTiles(player.hand);
     if (handCount === 0) {
-      // Valid BANANAS! — player wins with bonus
-      player.liveScore += BANANAS_BONUS;
+      // Valid YOINK! — player wins with bonus
+      player.liveScore += YOINK_BONUS;
       clearInterval(r.tick!);
       r.tick = undefined;
       r.started = false;
-      finalizeBananagramsRound(r, player.id);
+      finalizeYoinkRound(r, player.id);
     } else {
       // Invalid — penalize and continue
-      player.liveScore = Math.max(0, player.liveScore - BANANAS_PENALTY);
-      socket.emit("word:rejected", { word: "BANANAS!", reason: `hand not empty (${handCount} tiles left) — penalty ${BANANAS_PENALTY} pts` });
+      player.liveScore = Math.max(0, player.liveScore - YOINK_PENALTY);
+      socket.emit("word:rejected", { word: "YOINK!", reason: `hand not empty (${handCount} tiles left) — penalty ${YOINK_PENALTY} pts` });
       socket.emit("lobby:state", publicState(r, socket.id));
     }
   });
@@ -589,7 +589,7 @@ io.on("connection", (socket: Socket) => {
     const r = rooms.get(roomId);
     if (!r) return;
 
-    if (partial.gameMode === "yoink" || partial.gameMode === "bananagrams") {
+    if (partial.gameMode === "classic" || partial.gameMode === "yoink") {
       r.settings.gameMode = partial.gameMode;
     }
     if (typeof partial.durationSec === "number") {
@@ -603,11 +603,11 @@ io.on("connection", (socket: Socket) => {
     if (typeof partial.roundTiles === "number") {
       r.settings.roundTiles = Math.max(40, Math.min(200, Math.round(partial.roundTiles)));
     }
-    if (typeof partial.bananagramsInitialDraw === "number") {
-      r.settings.bananagramsInitialDraw = Math.max(7, Math.min(42, Math.round(partial.bananagramsInitialDraw)));
+    if (typeof partial.yoinkInitialDraw === "number") {
+      r.settings.yoinkInitialDraw = Math.max(7, Math.min(42, Math.round(partial.yoinkInitialDraw)));
     }
-    if (typeof partial.bananagramsDrawSize === "number") {
-      r.settings.bananagramsDrawSize = Math.max(1, Math.min(10, Math.round(partial.bananagramsDrawSize)));
+    if (typeof partial.yoinkDrawSize === "number") {
+      r.settings.yoinkDrawSize = Math.max(1, Math.min(10, Math.round(partial.yoinkDrawSize)));
     }
 
     // reset surge for next round

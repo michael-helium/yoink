@@ -13,8 +13,8 @@ export function scoreWord(word: string): number {
   return Math.round(base * bonus);
 }
 
-/** Bananagrams grid score: Σ(length²) − 3×unused. Floored at 0. */
-export function scoreBananagramsGrid(words: string[], unusedTileCount: number): number {
+/** Yoink grid score: Σ(length²) − 3×unused. Floored at 0. */
+export function scoreYoinkGrid(words: string[], unusedTileCount: number): number {
   const pts = words.reduce((s, w) => s + w.length * w.length, 0);
   return Math.max(0, pts - unusedTileCount * 3);
 }

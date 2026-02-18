@@ -1,7 +1,7 @@
-// server/src/bananagrams.ts — Bananagrams scoring helpers
+// server/src/yoink-scoring.ts — Yoink scoring helpers
 
 /**
- * Score a player's grid in Bananagrams mode.
+ * Score a player's grid in Yoink mode.
  *
  * Each word scores length² (rewards longer/more complex words).
  * Unused tiles penalise at 3 points each.
@@ -10,7 +10,7 @@
  * @param unusedTileCount  Number of tiles remaining in the player's hand
  * @returns Final score (floored at 0)
  */
-export function scoreBananagramsGrid(
+export function scoreYoinkGrid(
   words: string[],
   unusedTileCount: number
 ): number {
@@ -26,8 +26,8 @@ export function countTiles(hand: Record<string, number>): number {
   return Object.values(hand).reduce((s, n) => s + n, 0);
 }
 
-/** Bonus awarded when a player successfully calls BANANAS! */
-export const BANANAS_BONUS = 50;
+/** Bonus awarded when a player successfully calls YOINK! */
+export const YOINK_BONUS = 50;
 
-/** Penalty when a player calls BANANAS! but still has tiles. */
-export const BANANAS_PENALTY = 10;
+/** Penalty when a player calls YOINK! but still has tiles. */
+export const YOINK_PENALTY = 10;
