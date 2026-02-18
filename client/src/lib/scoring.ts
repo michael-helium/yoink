@@ -12,3 +12,9 @@ export function scoreWord(word: string): number {
   const bonus = 1 + 0.05 * word.length;
   return Math.round(base * bonus);
 }
+
+/** Bananagrams grid score: Σ(length²) − 3×unused. Floored at 0. */
+export function scoreBananagramsGrid(words: string[], unusedTileCount: number): number {
+  const pts = words.reduce((s, w) => s + w.length * w.length, 0);
+  return Math.max(0, pts - unusedTileCount * 3);
+}

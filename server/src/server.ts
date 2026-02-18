@@ -2,21 +2,26 @@ import express from "express";
 import http from "http";
 import { Server, Socket } from "socket.io";
 import { loadWordlists } from "./dict";
+import { scoreBananagramsGrid, countTiles } from "./bananagrams";
 
 // ===== Types =====
 type UniqueWordsMode = "disallow" | "allow_no_penalty" | "allow_with_decay";
 type DecayModel = "linear" | "soft" | "steep";
+type GameMode = "yoink" | "bananagrams";
 
 type Settings = {
-  durationSec: number;          // 30–600 (default 120)
-  minLen: number;               // 2–6   (default 3)
-  uniqueWords: UniqueWordsMode; // default allow_with_decay
-  decayModel: DecayModel;       // default linear
-  revealModel: "drip_surge";    // kept simple for now
-  roundTiles: number;           // 40–200 (default 100)
-  dripPerSec: number;           // default 2
-  surgeAtSec: number;           // default 60
-  surgeAmount: number;          // default 10 (one-time)
+  gameMode: GameMode;             // default yoink
+  durationSec: number;            // 30–600 (default 120)
+  minLen: number;                 // 2–6   (default 3)
+  uniqueWords: UniqueWordsMode;   // default allow_with_decay
+  decayModel: DecayModel;         // default linear
+  revealModel: "drip_surge";      // kept simple for now
+  roundTiles: number;             // 40–200 (default 100)
+  dripPerSec: number;             // default 2
+  surgeAtSec: number;             // default 60
+  surgeAmount: number;            // default 10 (one-time)
+  bananagramsInitialDraw: number; // tiles dealt to each player at start (default 21)
+  bananagramsDrawSize: number;    // tiles drawn per "peel" request (default 3)
 };
 
 type Player = {
@@ -24,6 +29,7 @@ type Player = {
   name: string;
   liveScore: number; // score during round (pre-decay)
   words: { word: string; base: number }[];
+  hand: Record<string, number>; // bananagrams personal hand
 };
 
 type Submission = {
@@ -152,16 +158,32 @@ function nowWindowKey(nowMs: number, sizeMs: number): number {
   return Math.floor(nowMs / sizeMs);
 }
 
-function publicState(r: RoomState) {
+function publicState(r: RoomState, forSocketId?: string) {
   return {
     id: r.id,
     settings: r.settings,
     players: [...r.players.values()].map(p => ({ id: p.id, name: p.name, score: p.liveScore })),
-    pool: r.pool, // sharing counts; if you want fog-of-war later, you can hide this
+    pool: r.settings.gameMode === "yoink" ? r.pool : {}, // hide shared pool in bananagrams
     endsInMs: Math.max(0, (r.endAt ?? Date.now()) - Date.now()),
     revealed: r.revealed,
-    roundTiles: r.settings.roundTiles
+    roundTiles: r.settings.roundTiles,
+    bagRemaining: r.bag.length - r.revealed, // useful for bananagrams UI
+    hand: forSocketId && r.settings.gameMode === "bananagrams"
+      ? (r.players.get(forSocketId)?.hand ?? {})
+      : undefined
   };
+}
+
+function emitStateToAll(r: RoomState) {
+  if (r.settings.gameMode === "yoink") {
+    io.to(r.id).emit("lobby:state", publicState(r));
+  } else {
+    // bananagrams: each player gets their own hand
+    for (const [sid] of r.players) {
+      const s = io.sockets.sockets.get(sid);
+      if (s) s.emit("lobby:state", publicState(r, sid));
+    }
+  }
 }
 
 // ===== Rate limiter: 5/sec, burst 10 =====
@@ -188,6 +210,7 @@ function ensureRoom(roomId: string): RoomState {
   if (r) return r;
 
   const settings: Settings = {
+    gameMode: "yoink",
     durationSec: 120,
     minLen: 3,
     uniqueWords: "allow_with_decay",
@@ -196,7 +219,9 @@ function ensureRoom(roomId: string): RoomState {
     roundTiles: 100,
     dripPerSec: 2,
     surgeAtSec: 60,
-    surgeAmount: 10
+    surgeAmount: 10,
+    bananagramsInitialDraw: 21,
+    bananagramsDrawSize: 3
   };
 
   r = {
@@ -215,6 +240,21 @@ function ensureRoom(roomId: string): RoomState {
   return r;
 }
 
+/** Draw `count` tiles from bag into a player's hand. Returns number actually drawn. */
+function drawTiles(r: RoomState, player: Player, count: number): number {
+  const available = r.bag.length - r.revealed;
+  const take = Math.min(count, available);
+  const tiles = r.bag.slice(r.revealed, r.revealed + take);
+  for (const ch of tiles) player.hand[ch] = (player.hand[ch] ?? 0) + 1;
+  r.revealed += take;
+  return take;
+}
+
+/** Check if the bag is exhausted (bananagrams end condition). */
+function isBagEmpty(r: RoomState): boolean {
+  return r.revealed >= r.bag.length;
+}
+
 function startRound(r: RoomState) {
   // reset per-round state
   r.pool = {};
@@ -225,10 +265,34 @@ function startRound(r: RoomState) {
   for (const p of r.players.values()) {
     p.liveScore = 0;
     p.words = [];
+    p.hand = {};
   }
   r.started = true;
   r.endAt = Date.now() + r.settings.durationSec * 1000;
 
+  if (r.settings.gameMode === "bananagrams") {
+    // Deal initial hand to each player instantly
+    for (const p of r.players.values()) {
+      drawTiles(r, p, r.settings.bananagramsInitialDraw);
+    }
+
+    // Bananagrams tick: just a timer, no drip
+    r.tick && clearInterval(r.tick);
+    r.tick = setInterval(() => {
+      const now = Date.now();
+      if (now >= (r.endAt ?? now) || isBagEmpty(r)) {
+        clearInterval(r.tick!);
+        r.tick = undefined;
+        r.started = false;
+        finalizeBananagramsRound(r);
+        return;
+      }
+      emitStateToAll(r);
+    }, 1000);
+    return;
+  }
+
+  // ---- Yoink mode (original) ----
   // opening flood (20 tiles)
   const open = Math.min(20, r.settings.roundTiles);
   const opening = r.bag.slice(0, open);
@@ -268,7 +332,7 @@ function startRound(r: RoomState) {
     }
 
     // emit state
-    io.to(r.id).emit("lobby:state", publicState(r));
+    emitStateToAll(r);
 
     // process the shadow window that just closed
     const key = nowWindowKey(now - r.shadowWindowMs, r.shadowWindowMs);
@@ -356,7 +420,21 @@ function finalizeRoundWithDecay(r: RoomState) {
     .sort((a, b) => b.finalScore - a.finalScore);
 
   io.to(r.id).emit("round:ended", { leaderboard: final });
-  io.to(r.id).emit("lobby:state", publicState(r));
+  emitStateToAll(r);
+}
+
+function finalizeBananagramsRound(r: RoomState) {
+  const final = [...r.players.values()]
+    .map(p => {
+      const unusedCount = countTiles(p.hand);
+      const wordStrs = p.words.map(w => w.word);
+      const finalScore = scoreBananagramsGrid(wordStrs, unusedCount);
+      return { id: p.id, name: p.name, finalScore };
+    })
+    .sort((a, b) => b.finalScore - a.finalScore);
+
+  io.to(r.id).emit("round:ended", { leaderboard: final });
+  emitStateToAll(r);
 }
 
 // ===== Socket wiring =====
@@ -373,14 +451,15 @@ io.on("connection", (socket: Socket) => {
       id: socket.id,
       name: name?.slice(0, 16) || "Player",
       liveScore: 0,
-      words: []
+      words: [],
+      hand: {}
     });
     socket.join(room);
 
     // auto-start if idle
     if (!r.started) startRound(r);
 
-    io.to(room).emit("lobby:state", publicState(r));
+    emitStateToAll(r);
   });
 
   socket.on("word:submit", (payload: { word: string }) => {
@@ -392,10 +471,63 @@ io.on("connection", (socket: Socket) => {
     if (!allowSubmit(socket.id)) return;
 
     const word = (payload.word || "").toUpperCase();
+
+    if (r.settings.gameMode === "bananagrams") {
+      // Bananagrams: validate & consume from player's personal hand immediately
+      const player = r.players.get(playerId);
+      if (!player) return;
+      if (!/^[A-Z]+$/.test(word)) return;
+      if (word.length < r.settings.minLen) return;
+      if (!DICT.has(word)) return;
+      if (!canConsumeWord(word, player.hand)) return;
+
+      consumeWord(word, player.hand);
+      const pts = word.length * word.length; // bananagrams scoring: length²
+      player.words.push({ word, base: pts });
+      player.liveScore += pts;
+
+      socket.emit("word:accepted", {
+        playerId,
+        name: player.name,
+        letters: word.length,
+        points: pts,
+        feed: `${player.name} placed ${word} (${pts} pts)`
+      });
+      // Send updated hand to this player
+      socket.emit("lobby:state", publicState(r, socket.id));
+      // Broadcast scores to everyone
+      io.to(r.id).emit("scores:update",
+        [...r.players.values()].map(p => ({ id: p.id, name: p.name, score: p.liveScore }))
+      );
+      return;
+    }
+
+    // Yoink mode: queue into shadow window
     const ts = Date.now();
     const key = nowWindowKey(ts, r.shadowWindowMs);
     if (!r.pending.has(key)) r.pending.set(key, []);
     r.pending.get(key)!.push({ ts, socketId: socket.id, playerId, word });
+  });
+
+  // Bananagrams: draw more tiles from the common bag ("peel")
+  socket.on("tiles:draw", () => {
+    if (!roomId || !playerId) return;
+    const r = rooms.get(roomId);
+    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    const player = r.players.get(playerId);
+    if (!player) return;
+
+    const drawn = drawTiles(r, player, r.settings.bananagramsDrawSize);
+    if (drawn > 0) {
+      socket.emit("lobby:state", publicState(r, socket.id));
+      // If bag is now empty, end the round
+      if (isBagEmpty(r)) {
+        clearInterval(r.tick!);
+        r.tick = undefined;
+        r.started = false;
+        finalizeBananagramsRound(r);
+      }
+    }
   });
 
   // --- Settings & Start ---
@@ -404,6 +536,9 @@ io.on("connection", (socket: Socket) => {
     const r = rooms.get(roomId);
     if (!r) return;
 
+    if (partial.gameMode === "yoink" || partial.gameMode === "bananagrams") {
+      r.settings.gameMode = partial.gameMode;
+    }
     if (typeof partial.durationSec === "number") {
       r.settings.durationSec = Math.max(30, Math.min(600, Math.round(partial.durationSec)));
     }
@@ -415,11 +550,17 @@ io.on("connection", (socket: Socket) => {
     if (typeof partial.roundTiles === "number") {
       r.settings.roundTiles = Math.max(40, Math.min(200, Math.round(partial.roundTiles)));
     }
+    if (typeof partial.bananagramsInitialDraw === "number") {
+      r.settings.bananagramsInitialDraw = Math.max(7, Math.min(42, Math.round(partial.bananagramsInitialDraw)));
+    }
+    if (typeof partial.bananagramsDrawSize === "number") {
+      r.settings.bananagramsDrawSize = Math.max(1, Math.min(10, Math.round(partial.bananagramsDrawSize)));
+    }
 
     // reset surge for next round
     r.settings.surgeAmount = 10;
 
-    io.to(roomId).emit("lobby:state", publicState(r));
+    emitStateToAll(r);
   });
 
   socket.on("game:start", () => {
@@ -427,7 +568,7 @@ io.on("connection", (socket: Socket) => {
     const r = rooms.get(roomId);
     if (!r) return;
     startRound(r);
-    io.to(roomId).emit("lobby:state", publicState(r));
+    emitStateToAll(r);
   });
 
   socket.on("disconnect", () => {
@@ -435,7 +576,7 @@ io.on("connection", (socket: Socket) => {
     const r = rooms.get(roomId);
     if (!r) return;
     r.players.delete(playerId);
-    io.to(roomId).emit("lobby:state", publicState(r));
+    emitStateToAll(r);
   });
 });
 

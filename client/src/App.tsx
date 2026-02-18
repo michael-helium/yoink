@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { POINTS, scoreWord } from "./lib/scoring";
+import { POINTS, scoreWord, scoreBananagramsGrid } from "./lib/scoring";
 
 // ===== Types that mirror server payloads =====
 type ServerState = {
   id: string;
   settings: {
+    gameMode: "yoink" | "bananagrams";
     durationSec: number;
     minLen: number;
     uniqueWords: "disallow" | "allow_no_penalty" | "allow_with_decay";
@@ -15,12 +16,16 @@ type ServerState = {
     dripPerSec: number;
     surgeAtSec: number;
     surgeAmount: number;
+    bananagramsInitialDraw: number;
+    bananagramsDrawSize: number;
   };
   players: { id: string; name: string; score: number }[];
   pool: Record<string, number>;
   endsInMs: number;
   revealed: number;
   roundTiles: number;
+  bagRemaining: number;
+  hand?: Record<string, number>;
 };
 
 type AcceptedEvt = {
@@ -93,9 +98,13 @@ export default function App() {
   const [feed, setFeed] = useState<string[]>([]);
   const [input, setInput] = useState("");
 
+  // ---- Game mode (offline) ----
+  const [gameMode, setGameMode] = useState<"yoink" | "bananagrams">("yoink");
+
   // ---- Offline demo round state ----
   const [timeLeft, setTimeLeft] = useState(120);
   const [pool, setPool] = useState<Record<string, number>>({});
+  const [hand, setHand] = useState<Record<string, number>>({}); // bananagrams personal hand
   const [revealed, setRevealed] = useState(0);
   const roundTiles = 100;
   const dripPerSec = 2;
@@ -158,17 +167,56 @@ export default function App() {
   }
 
   // ---- Offline demo round control ----
+  // ---- Offline bananagrams: draw from bag into hand ----
+  function offlineDrawTiles(count: number) {
+    setRevealed((rev) => {
+      const bag = bagRef.current;
+      const avail = bag.length - rev;
+      const take = Math.min(count, avail);
+      if (take <= 0) return rev;
+      const tiles = bag.slice(rev, rev + take);
+      setHand((h) => {
+        const next = { ...h };
+        for (const ch of tiles) next[ch] = (next[ch] ?? 0) + 1;
+        return next;
+      });
+      return rev + take;
+    });
+  }
+
   function startOfflineRound() {
     setFeed([]);
     setMyScore(0);
     setMyWords([]);
     setPool({});
+    setHand({});
     setRevealed(0);
     setSurgeUsed(false);
     setTimeLeft(120);
     bagRef.current = makeBag();
 
-    // Opening flood
+    if (gameMode === "bananagrams") {
+      // Deal 21 tiles to hand instantly
+      const initial = bagRef.current.slice(0, 21);
+      const startHand: Record<string, number> = {};
+      for (const ch of initial) startHand[ch] = (startHand[ch] ?? 0) + 1;
+      setHand(startHand);
+      setRevealed(21);
+
+      timerRef.current && clearInterval(timerRef.current);
+      timerRef.current = window.setInterval(() => {
+        setTimeLeft((t) => {
+          if (t <= 1 || bagRef.current.length <= revealed) {
+            clearInterval(timerRef.current!);
+            return 0;
+          }
+          return t - 1;
+        });
+      }, 1000) as unknown as number;
+      return;
+    }
+
+    // ---- Yoink offline (original) ----
     const open = Math.min(20, roundTiles);
     const initial = bagRef.current.slice(0, open);
     const startPool: Record<string, number> = {};
@@ -237,8 +285,14 @@ export default function App() {
   }
 
   // ---- Build a flat, randomized tile list for display ----
+  const currentMode = offlineSim ? gameMode : (state?.settings.gameMode ?? "yoink");
   const tiles = useMemo(() => {
-    const src = offlineSim ? pool : (state?.pool || {});
+    let src: Record<string, number>;
+    if (offlineSim) {
+      src = currentMode === "bananagrams" ? hand : pool;
+    } else {
+      src = currentMode === "bananagrams" ? (state?.hand || {}) : (state?.pool || {});
+    }
     const arr: string[] = [];
     for (const [ch, count] of Object.entries(src)) {
       for (let i = 0; i < (count ?? 0); i++) arr.push(ch);
@@ -248,7 +302,7 @@ export default function App() {
       [arr[i], arr[j]] = [arr[j], arr[i]];
     }
     return arr;
-  }, [offlineSim, pool, state?.pool]);
+  }, [offlineSim, pool, hand, state?.pool, state?.hand, currentMode]);
 
   // ---- Submit handler (works online & offline) ----
   function submit() {
@@ -258,6 +312,18 @@ export default function App() {
 
     if (offlineSim) {
       if (w.length < 3) return;
+
+      if (gameMode === "bananagrams") {
+        if (!canConsume(w, hand)) return;
+        const pts = w.length * w.length;
+        setMyScore((s) => s + pts);
+        setMyWords((ws) => [...ws, w]);
+        setHand((h) => consume(w, h));
+        setFeed((prev) => [`${name} placed ${w} (${pts} pts)`, ...prev].slice(0, 10));
+        setInput("");
+        return;
+      }
+
       if (!canConsume(w, pool)) return;
       const pts = scoreWord(w);
       setMyScore((s) => s + pts);
@@ -274,9 +340,14 @@ export default function App() {
   }
 
   // ---- Derived UI bits ----
-  const tilesText = offlineSim
-    ? `${revealed}/${roundTiles}`
-    : `${state?.revealed ?? 0}/${state?.roundTiles ?? 0}`;
+  const bagRemaining = offlineSim
+    ? bagRef.current.length - revealed
+    : (state?.bagRemaining ?? 0);
+  const tilesText = currentMode === "bananagrams"
+    ? `Bag: ${bagRemaining} left`
+    : offlineSim
+      ? `${revealed}/${roundTiles}`
+      : `${state?.revealed ?? 0}/${state?.roundTiles ?? 0}`;
   const seconds = offlineSim ? timeLeft : Math.ceil((state?.endsInMs ?? 0) / 1000);
   const playersCount = offlineSim ? 1 : (state?.players.length ?? 0);
 
@@ -285,7 +356,9 @@ export default function App() {
       {/* Header / Lobby */}
       <header className="p-4 border-b border-neutral-800">
         <h1 className="text-2xl font-semibold">YOINK</h1>
-        <p className="text-neutral-400 text-sm">Shared-pool speed word game</p>
+        <p className="text-neutral-400 text-sm">
+          {currentMode === "bananagrams" ? "Bananagrams — build your grid!" : "Shared-pool speed word game"}
+        </p>
 
         {/* Join controls (when not connected and not in offline demo) */}
         {!connected && !offlineSim && (
@@ -310,7 +383,7 @@ export default function App() {
 
         {/* Offline demo controls (if server missing/unreachable) */}
         {offlineSim && (
-          <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3 items-end">
+          <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-4 items-end">
             <label className="text-xs text-neutral-400 sm:col-span-2">
               Your name
               <input
@@ -319,10 +392,21 @@ export default function App() {
                 onChange={(e) => setName(e.target.value)}
               />
             </label>
+            <label className="text-xs text-neutral-400">
+              Mode
+              <select
+                className="w-full mt-1 rounded-xl bg-neutral-800 px-3 py-2 outline-none"
+                value={gameMode}
+                onChange={(e) => setGameMode(e.target.value as "yoink" | "bananagrams")}
+              >
+                <option value="yoink">Yoink</option>
+                <option value="bananagrams">Bananagrams</option>
+              </select>
+            </label>
             <button className="rounded-xl bg-amber-500 px-3 py-2 font-semibold" onClick={startOfflineRound}>
               Play offline demo
             </button>
-            <div className="sm:col-span-3 text-xs text-amber-300 mt-1">
+            <div className="sm:col-span-4 text-xs text-amber-300 mt-1">
               Server not reachable — playing offline on your device.
             </div>
           </div>
@@ -331,6 +415,18 @@ export default function App() {
         {/* Settings panel (visible only when connected to server multiplayer) */}
         {connected && !offlineSim && (
           <div className="mt-3 grid grid-cols-1 sm:grid-cols-5 gap-2 items-end">
+            <label className="text-xs text-neutral-400">
+              Mode
+              <select
+                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
+                defaultValue={state?.settings.gameMode ?? "yoink"}
+                onChange={(e) => sockRef.current?.emit("settings:update", { gameMode: e.target.value })}
+              >
+                <option value="yoink">Yoink</option>
+                <option value="bananagrams">Bananagrams</option>
+              </select>
+            </label>
+
             <label className="text-xs text-neutral-400">
               Round (s)
               <input
@@ -417,8 +513,26 @@ export default function App() {
         <div className="text-sm text-neutral-400">Players: {playersCount}</div>
       </div>
 
-      {/* Pool (small, randomized Scrabble-style tiles) */}
+      {/* Pool / Hand tiles */}
       <section className="px-4">
+        {currentMode === "bananagrams" && (
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm text-neutral-400">Your hand ({tiles.length} tiles)</span>
+            <button
+              className="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold"
+              onClick={() => {
+                if (offlineSim) {
+                  offlineDrawTiles(3);
+                } else {
+                  sockRef.current?.emit("tiles:draw");
+                }
+              }}
+              disabled={seconds <= 0}
+            >
+              Draw 3 (Peel)
+            </button>
+          </div>
+        )}
         <div
           className="grid gap-2"
           style={{ gridTemplateColumns: "repeat(auto-fill, minmax(56px, 1fr))" }}
