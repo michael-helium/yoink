@@ -2,41 +2,49 @@ import express from "express";
 import http from "http";
 import { Server, Socket } from "socket.io";
 import { loadWordlists } from "./dict";
-import { scoreYoinkGrid, countTiles, YOINK_BONUS, YOINK_PENALTY } from "./yoink-scoring";
+import {
+  scoreYoinkGrid, countTiles, YOINK_BONUS, YOINK_PENALTY,
+  scoreYoinkWord, weightedRandomLetter, spawnIntervalMs, YOINK_POINTS, ROUND_MULTIPLIERS
+} from "./yoink-scoring";
 
 // ===== Types =====
 type UniqueWordsMode = "disallow" | "allow_no_penalty" | "allow_with_decay";
 type DecayModel = "linear" | "soft" | "steep";
 type GameMode = "classic" | "yoink";
+type Phase = "lobby" | "playing" | "intermission" | "finished";
 
 type Settings = {
-  gameMode: GameMode;             // default yoink (personal hand mode)
-  durationSec: number;            // 30–600 (default 120)
-  minLen: number;                 // 2–6   (default 3)
-  uniqueWords: UniqueWordsMode;   // default allow_with_decay
-  decayModel: DecayModel;         // default linear
-  revealModel: "drip_surge";      // kept simple for now
-  roundTiles: number;             // 40–200 (default 100)
-  dripPerSec: number;             // default 2
-  surgeAtSec: number;             // default 60
-  surgeAmount: number;            // default 10 (one-time)
-  yoinkInitialDraw: number; // tiles dealt to each player at start (default 21)
-  yoinkDrawSize: number;    // tiles drawn per "peel" request (default 3)
+  gameMode: GameMode;
+  durationSec: number;            // classic mode duration (default 120)
+  minLen: number;                 // 2–6 (default 3)
+  uniqueWords: UniqueWordsMode;   // classic mode
+  decayModel: DecayModel;         // classic mode
+  revealModel: "drip_surge";
+  roundTiles: number;             // classic mode (40–200, default 100)
+  dripPerSec: number;
+  surgeAtSec: number;
+  surgeAmount: number;
+  // Yoink mode settings
+  rounds: number;                 // default 3
+  roundDurationSec: number;       // default 60
+  intermissionSec: number;        // default 10
 };
 
 type Player = {
   id: string;
   name: string;
-  liveScore: number; // score during round (pre-decay)
+  liveScore: number;
   words: { word: string; base: number }[];
-  hand: Record<string, number>; // yoink personal hand
+  hand: Record<string, number>; // classic: unused; yoink: personal bank (max 7)
+  bank: string[];               // yoink: ordered bank array (max 7)
+  lastYoinkTime: number;        // yoink cooldown tracking
 };
 
 type Submission = {
-  ts: number;        // arrival time (ms)
+  ts: number;
   socketId: string;
   playerId: string;
-  word: string;      // UPPERCASE
+  word: string;
 };
 
 type RoomState = {
@@ -44,23 +52,31 @@ type RoomState = {
   settings: Settings;
   players: Map<string, Player>;
 
-  // tiles
-  pool: Record<string, number>; // authoritative current pool
-  bag: string[];                // shuffled full bag for the round
-  revealed: number;             // tiles revealed so far
+  // Classic mode tiles
+  pool: Record<string, number>;
+  bag: string[];
+  revealed: number;
 
-  // round lifecycle
+  // Yoink mode shared pool (4×4 grid, 16 slots)
+  yoinkPool: (string | null)[];
+  spawnTimer?: NodeJS.Timeout;
+
+  // Round lifecycle
   started: boolean;
+  phase: Phase;
+  currentRound: number;          // 1-indexed
+  totalRounds: number;
+  cumulativeScores: Map<string, number>;
   endAt?: number;
   tick?: NodeJS.Timeout;
 
-  // fairness + duplicates
-  shadowWindowMs: number;                 // e.g., 150ms
-  pending: Map<number, Submission[]>;     // windowKey -> submissions
-  wordCounts: Map<string, number>;        // global counts for decay
+  // Classic fairness
+  shadowWindowMs: number;
+  pending: Map<number, Submission[]>;
+  wordCounts: Map<string, number>;
 };
 
-// ===== Scoring / Bag =====
+// ===== Scoring / Bag (Classic) =====
 const POINTS: Record<string, number> = {
   "_": 0,
   E: 1, A: 1, O: 1, T: 1, I: 1, N: 1, R: 1, S: 1, L: 1, U: 1,
@@ -82,17 +98,14 @@ const COUNTS: Record<string, number> = {
 };
 
 // ===== Dictionary =====
-let DICT = new Set<string>(["TEAM", "BOX", "STONE", "RUSH"]); // tiny fallback
+let DICT = new Set<string>(["TEAM", "BOX", "STONE", "RUSH"]);
 
 async function initDictionary() {
   try {
     const env = (process.env.WORDLIST_URLS || "").trim();
     const urls = env
       ? env.split(",").map(s => s.trim()).filter(Boolean)
-      : [
-          // Example path from the wordnik/wordlist repo; adjust to the raw file you prefer:
-          "https://raw.githubusercontent.com/wordnik/wordlist/master/english/english.txt"
-        ];
+      : ["https://raw.githubusercontent.com/wordnik/wordlist/master/english/english.txt"];
     DICT = await loadWordlists(urls);
     console.log(`[dict] loaded ${DICT.size.toLocaleString()} words from ${urls.length} url(s).`);
   } catch (e) {
@@ -105,10 +118,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// Health
 app.get("/", (_req, res) => res.send("YOINK word server running"));
 
-// Rooms
 const rooms = new Map<string, RoomState>();
 
 // ===== Utils =====
@@ -123,7 +134,6 @@ function makeBag(): string[] {
   Object.entries(COUNTS).forEach(([ch, n]) => {
     for (let i = 0; i < n; i++) bag.push(ch);
   });
-  // Fisher–Yates shuffle
   for (let i = bag.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [bag[i], bag[j]] = [bag[j], bag[i]];
@@ -134,15 +144,12 @@ function makeBag(): string[] {
 function canConsumeWord(word: string, pool: Record<string, number>): boolean {
   const need: Record<string, number> = {};
   for (const ch of word) need[ch] = (need[ch] ?? 0) + 1;
-
   const have: Record<string, number> = { ...pool };
-  // Spend exact letters first
   for (const ch of Object.keys(need)) {
     const take = Math.min(need[ch], have[ch] ?? 0);
     need[ch] -= take;
     have[ch] = (have[ch] ?? 0) - take;
   }
-  // Use blanks for remainder
   const remain = Object.values(need).reduce((s, c) => s + c, 0);
   return (have["_"] ?? 0) >= remain;
 }
@@ -158,35 +165,97 @@ function nowWindowKey(nowMs: number, sizeMs: number): number {
   return Math.floor(nowMs / sizeMs);
 }
 
+// ===== Yoink pool helpers =====
+function fillYoinkPool(pool: (string | null)[]): void {
+  for (let i = 0; i < 16; i++) {
+    if (pool[i] === null) pool[i] = weightedRandomLetter();
+  }
+}
+
+function countPoolTiles(pool: (string | null)[]): number {
+  return pool.filter(t => t !== null).length;
+}
+
+function startSpawnTimer(r: RoomState) {
+  if (r.spawnTimer) clearTimeout(r.spawnTimer);
+
+  function scheduleNext() {
+    const count = countPoolTiles(r.yoinkPool);
+    if (count >= 16 || r.phase !== "playing") {
+      // Check again later if playing
+      if (r.phase === "playing") {
+        r.spawnTimer = setTimeout(scheduleNext, 500);
+      }
+      return;
+    }
+    const interval = spawnIntervalMs(count);
+    r.spawnTimer = setTimeout(() => {
+      if (r.phase !== "playing") return;
+      // Find a random empty slot
+      const empties = r.yoinkPool.map((t, i) => t === null ? i : -1).filter(i => i >= 0);
+      if (empties.length > 0) {
+        const idx = empties[Math.floor(Math.random() * empties.length)];
+        r.yoinkPool[idx] = weightedRandomLetter();
+        emitStateToAll(r);
+      }
+      scheduleNext();
+    }, interval);
+  }
+
+  scheduleNext();
+}
+
+// ===== State emission =====
 function publicState(r: RoomState, forSocketId?: string) {
+  if (r.settings.gameMode === "yoink") {
+    const player = forSocketId ? r.players.get(forSocketId) : undefined;
+    const roundIdx = Math.max(0, r.currentRound - 1);
+    const multiplier = ROUND_MULTIPLIERS[roundIdx] ?? 1.0;
+
+    return {
+      id: r.id,
+      settings: r.settings,
+      gameMode: "yoink" as const,
+      players: [...r.players.values()].map(p => ({
+        id: p.id,
+        name: p.name,
+        // Don't show scores during playing phase
+      })),
+      pool: r.yoinkPool,
+      bank: player?.bank ?? [],
+      myScore: player?.liveScore ?? 0,
+      endsInMs: Math.max(0, (r.endAt ?? Date.now()) - Date.now()),
+      phase: r.phase,
+      currentRound: r.currentRound,
+      totalRounds: r.totalRounds,
+      roundMultiplier: multiplier,
+      scoresHidden: r.phase === "playing",
+    };
+  }
+
+  // Classic mode
   return {
     id: r.id,
     settings: r.settings,
+    gameMode: "classic" as const,
     players: [...r.players.values()].map(p => ({ id: p.id, name: p.name, score: p.liveScore })),
-    pool: r.settings.gameMode === "classic" ? r.pool : {}, // hide shared pool in yoink mode
+    pool: r.pool,
     endsInMs: Math.max(0, (r.endAt ?? Date.now()) - Date.now()),
     revealed: r.revealed,
     roundTiles: r.settings.roundTiles,
-    bagRemaining: r.bag.length - r.revealed, // useful for yoink UI
-    hand: forSocketId && r.settings.gameMode === "yoink"
-      ? (r.players.get(forSocketId)?.hand ?? {})
-      : undefined
+    bagRemaining: r.bag.length - r.revealed,
+    hand: forSocketId ? (r.players.get(forSocketId)?.hand ?? {}) : undefined,
   };
 }
 
 function emitStateToAll(r: RoomState) {
-  if (r.settings.gameMode === "classic") {
-    io.to(r.id).emit("lobby:state", publicState(r));
-  } else {
-    // yoink: each player gets their own hand
-    for (const [sid] of r.players) {
-      const s = io.sockets.sockets.get(sid);
-      if (s) s.emit("lobby:state", publicState(r, sid));
-    }
+  for (const [sid] of r.players) {
+    const s = io.sockets.sockets.get(sid);
+    if (s) s.emit("lobby:state", publicState(r, sid));
   }
 }
 
-// ===== Rate limiter: 5/sec, burst 10 =====
+// ===== Rate limiter =====
 const buckets = new Map<string, { tokens: number; last: number }>();
 function allowSubmit(socketId: string): boolean {
   const cap = 10, rate = 5;
@@ -220,8 +289,9 @@ function ensureRoom(roomId: string): RoomState {
     dripPerSec: 2,
     surgeAtSec: 60,
     surgeAmount: 10,
-    yoinkInitialDraw: 21,
-    yoinkDrawSize: 3
+    rounds: 3,
+    roundDurationSec: 60,
+    intermissionSec: 10,
   };
 
   r = {
@@ -231,32 +301,119 @@ function ensureRoom(roomId: string): RoomState {
     pool: {},
     bag: [],
     revealed: 0,
+    yoinkPool: new Array(16).fill(null),
     started: false,
+    phase: "lobby",
+    currentRound: 0,
+    totalRounds: settings.rounds,
+    cumulativeScores: new Map(),
     shadowWindowMs: 150,
     pending: new Map(),
-    wordCounts: new Map()
+    wordCounts: new Map(),
   };
   rooms.set(roomId, r);
   return r;
 }
 
-/** Draw `count` tiles from bag into a player's hand. Returns number actually drawn. */
-function drawTiles(r: RoomState, player: Player, count: number): number {
-  const available = r.bag.length - r.revealed;
-  const take = Math.min(count, available);
-  const tiles = r.bag.slice(r.revealed, r.revealed + take);
-  for (const ch of tiles) player.hand[ch] = (player.hand[ch] ?? 0) + 1;
-  r.revealed += take;
-  return take;
+// ===== Yoink mode round flow =====
+function startYoinkGame(r: RoomState) {
+  r.totalRounds = r.settings.rounds;
+  r.currentRound = 0;
+  r.cumulativeScores.clear();
+  for (const p of r.players.values()) {
+    r.cumulativeScores.set(p.id, 0);
+  }
+  startNextYoinkRound(r);
 }
 
-/** Check if the bag is exhausted (yoink end condition). */
-function isBagEmpty(r: RoomState): boolean {
-  return r.revealed >= r.bag.length;
+function startNextYoinkRound(r: RoomState) {
+  r.currentRound++;
+  r.phase = "playing";
+  r.started = true;
+
+  // Reset pool and banks
+  r.yoinkPool = new Array(16).fill(null);
+  fillYoinkPool(r.yoinkPool);
+
+  for (const p of r.players.values()) {
+    p.liveScore = 0;
+    p.words = [];
+    p.hand = {};
+    p.bank = [];
+    p.lastYoinkTime = 0;
+  }
+
+  r.wordCounts.clear();
+  r.endAt = Date.now() + r.settings.roundDurationSec * 1000;
+
+  // Start spawn timer
+  startSpawnTimer(r);
+
+  // Tick timer
+  r.tick && clearInterval(r.tick);
+  r.tick = setInterval(() => {
+    const now = Date.now();
+    if (now >= (r.endAt ?? now)) {
+      clearInterval(r.tick!);
+      r.tick = undefined;
+      if (r.spawnTimer) { clearTimeout(r.spawnTimer); r.spawnTimer = undefined; }
+      endYoinkRound(r);
+      return;
+    }
+    emitStateToAll(r);
+  }, 1000);
+
+  emitStateToAll(r);
 }
 
-function startRound(r: RoomState) {
-  // reset per-round state
+function endYoinkRound(r: RoomState) {
+  // Calculate round scores and add to cumulative
+  const roundResults: { id: string; name: string; roundScore: number; cumulativeScore: number }[] = [];
+
+  for (const p of r.players.values()) {
+    const cumBefore = r.cumulativeScores.get(p.id) ?? 0;
+    const cumAfter = cumBefore + p.liveScore;
+    r.cumulativeScores.set(p.id, cumAfter);
+    roundResults.push({
+      id: p.id,
+      name: p.name,
+      roundScore: p.liveScore,
+      cumulativeScore: cumAfter,
+    });
+  }
+
+  roundResults.sort((a, b) => b.cumulativeScore - a.cumulativeScore);
+
+  io.to(r.id).emit("round:ended", {
+    round: r.currentRound,
+    totalRounds: r.totalRounds,
+    leaderboard: roundResults,
+  });
+
+  if (r.currentRound >= r.totalRounds) {
+    // Game over
+    r.phase = "finished";
+    r.started = false;
+    io.to(r.id).emit("game:ended", {
+      leaderboard: roundResults,
+    });
+    emitStateToAll(r);
+  } else {
+    // Intermission
+    r.phase = "intermission";
+    r.endAt = Date.now() + r.settings.intermissionSec * 1000;
+    emitStateToAll(r);
+
+    setTimeout(() => {
+      if (r.phase === "intermission") {
+        startNextYoinkRound(r);
+      }
+    }, r.settings.intermissionSec * 1000);
+  }
+}
+
+// ===== Classic mode =====
+function startClassicRound(r: RoomState) {
   r.pool = {};
   r.bag = makeBag();
   r.revealed = 0;
@@ -266,40 +423,17 @@ function startRound(r: RoomState) {
     p.liveScore = 0;
     p.words = [];
     p.hand = {};
+    p.bank = [];
   }
   r.started = true;
+  r.phase = "playing";
   r.endAt = Date.now() + r.settings.durationSec * 1000;
 
-  if (r.settings.gameMode === "yoink") {
-    // Deal initial hand to each player instantly
-    for (const p of r.players.values()) {
-      drawTiles(r, p, r.settings.yoinkInitialDraw);
-    }
-
-    // Yoink tick: just a timer, no drip. Bag empty does NOT auto-end.
-    r.tick && clearInterval(r.tick);
-    r.tick = setInterval(() => {
-      const now = Date.now();
-      if (now >= (r.endAt ?? now)) {
-        clearInterval(r.tick!);
-        r.tick = undefined;
-        r.started = false;
-        finalizeYoinkRound(r);
-        return;
-      }
-      emitStateToAll(r);
-    }, 1000);
-    return;
-  }
-
-  // ---- Classic mode (shared pool) ----
-  // opening flood (20 tiles)
   const open = Math.min(20, r.settings.roundTiles);
   const opening = r.bag.slice(0, open);
   for (const ch of opening) r.pool[ch] = (r.pool[ch] ?? 0) + 1;
   r.revealed = open;
 
-  // tick
   r.tick && clearInterval(r.tick);
   r.tick = setInterval(() => {
     const now = Date.now();
@@ -311,7 +445,6 @@ function startRound(r: RoomState) {
       return;
     }
 
-    // drip
     if (r.revealed < r.settings.roundTiles) {
       const take = Math.min(r.settings.dripPerSec, r.settings.roundTiles - r.revealed);
       const more = r.bag.slice(r.revealed, r.revealed + take);
@@ -319,7 +452,6 @@ function startRound(r: RoomState) {
       r.revealed += take;
     }
 
-    // surge once, when elapsed >= surgeAtSec
     const elapsed = Math.round(((r.settings.durationSec * 1000) - ((r.endAt ?? now) - now)) / 1000);
     if (elapsed >= r.settings.surgeAtSec && r.settings.surgeAmount > 0) {
       const take = Math.min(r.settings.surgeAmount, r.settings.roundTiles - r.revealed);
@@ -328,13 +460,10 @@ function startRound(r: RoomState) {
         for (const ch of more) r.pool[ch] = (r.pool[ch] ?? 0) + 1;
         r.revealed += take;
       }
-      r.settings.surgeAmount = 0; // make it one-time
+      r.settings.surgeAmount = 0;
     }
 
-    // emit state
     emitStateToAll(r);
-
-    // process the shadow window that just closed
     const key = nowWindowKey(now - r.shadowWindowMs, r.shadowWindowMs);
     processShadowWindow(r, key);
   }, 1000);
@@ -344,42 +473,33 @@ function processShadowWindow(r: RoomState, windowKey: number) {
   const subs = r.pending.get(windowKey);
   if (!subs || subs.length === 0) return;
 
-  // Snapshot pool for fairness
   const snapshot: Record<string, number> = { ...r.pool };
   subs.sort((a, b) => a.ts - b.ts);
 
   const accepted: Submission[] = [];
   for (const s of subs) {
     const word = s.word;
-
-    // Validation
     if (!/^[A-Z]+$/.test(word)) continue;
     if (word.length < r.settings.minLen) continue;
     if (!DICT.has(word)) continue;
-
     if (r.settings.uniqueWords === "disallow") {
       const p = r.players.get(s.playerId);
       if (p && p.words.find(w => w.word === word)) continue;
     }
-
-    // Against snapshot
     if (canConsumeWord(word, snapshot)) {
       consumeWord(word, snapshot);
       accepted.push(s);
     }
   }
 
-  // Apply to authoritative state + emit success-only feed
   for (const s of accepted) {
     const p = r.players.get(s.playerId);
     if (!p) continue;
-
     const pts = scoreWord(s.word);
     consumeWord(s.word, r.pool);
     p.words.push({ word: s.word, base: pts });
     p.liveScore += pts;
     r.wordCounts.set(s.word, (r.wordCounts.get(s.word) ?? 0) + 1);
-
     io.to(r.id).emit("word:accepted", {
       playerId: s.playerId,
       name: p.name,
@@ -394,17 +514,14 @@ function processShadowWindow(r: RoomState, windowKey: number) {
 
 function finalizeRoundWithDecay(r: RoomState) {
   const model = r.settings.decayModel;
-
   function decay(base: number, c: number): number {
     if (r.settings.uniqueWords === "allow_no_penalty") return base;
-    if (r.settings.uniqueWords === "disallow") return base; // duplicates were ignored
+    if (r.settings.uniqueWords === "disallow") return base;
     if (c <= 1) return base;
-
     let factor = 1;
     if (model === "linear") factor = 1 / c;
     else if (model === "soft") factor = 1 / (1 + 0.6 * (c - 1));
     else if (model === "steep") factor = 1 / Math.pow(c, 1.3);
-
     return Math.round(base * factor);
   }
 
@@ -423,20 +540,24 @@ function finalizeRoundWithDecay(r: RoomState) {
   emitStateToAll(r);
 }
 
-function finalizeYoinkRound(r: RoomState, yoinkWinnerId?: string) {
-  const final = [...r.players.values()]
-    .map(p => {
-      const unusedCount = countTiles(p.hand);
-      const wordStrs = p.words.map(w => w.word);
-      let finalScore = scoreYoinkGrid(wordStrs, unusedCount);
-      // liveScore already includes YOINK_BONUS if applicable
-      if (yoinkWinnerId === p.id) finalScore += YOINK_BONUS;
-      return { id: p.id, name: p.name, finalScore };
-    })
-    .sort((a, b) => b.finalScore - a.finalScore);
+// ===== Check if bank letter array can form word =====
+function canConsumeFromBank(word: string, bank: string[]): boolean {
+  const available = [...bank];
+  for (const ch of word.toUpperCase()) {
+    const idx = available.indexOf(ch);
+    if (idx === -1) return false;
+    available.splice(idx, 1);
+  }
+  return true;
+}
 
-  io.to(r.id).emit("round:ended", { leaderboard: final });
-  emitStateToAll(r);
+function consumeFromBank(word: string, bank: string[]): string[] {
+  const remaining = [...bank];
+  for (const ch of word.toUpperCase()) {
+    const idx = remaining.indexOf(ch);
+    if (idx !== -1) remaining.splice(idx, 1);
+  }
+  return remaining;
 }
 
 // ===== Socket wiring =====
@@ -449,67 +570,121 @@ io.on("connection", (socket: Socket) => {
     playerId = socket.id;
 
     const r = ensureRoom(room);
-    r.players.set(socket.id, {
-      id: socket.id,
-      name: name?.slice(0, 16) || "Player",
-      liveScore: 0,
-      words: [],
-      hand: {}
-    });
+    if (!r.players.has(socket.id)) {
+      r.players.set(socket.id, {
+        id: socket.id,
+        name: name?.slice(0, 16) || "Player",
+        liveScore: 0,
+        words: [],
+        hand: {},
+        bank: [],
+        lastYoinkTime: 0,
+      });
+      r.cumulativeScores.set(socket.id, 0);
+    }
     socket.join(room);
-
-    // auto-start if idle
-    if (!r.started) startRound(r);
-
     emitStateToAll(r);
   });
 
+  // ===== tile:yoink — grab a tile from shared pool =====
+  socket.on("tile:yoink", (payload: { index: number }) => {
+    if (!roomId || !playerId) return;
+    const r = rooms.get(roomId);
+    if (!r || r.phase !== "playing" || r.settings.gameMode !== "yoink") return;
+
+    const player = r.players.get(playerId);
+    if (!player) return;
+
+    const { index } = payload;
+    if (typeof index !== "number" || index < 0 || index > 15) return;
+
+    // Check tile exists
+    const tile = r.yoinkPool[index];
+    if (tile === null) return;
+
+    // Check bank has room (< 7)
+    if (player.bank.length >= 7) {
+      socket.emit("yoink:rejected", { reason: "bank full" });
+      return;
+    }
+
+    // 500ms cooldown
+    const now = Date.now();
+    if (now - player.lastYoinkTime < 500) {
+      socket.emit("yoink:rejected", { reason: "too fast" });
+      return;
+    }
+
+    // Success — first to server wins
+    player.lastYoinkTime = now;
+    r.yoinkPool[index] = null;
+    player.bank.push(tile);
+
+    // Restart spawn timer since a tile was taken
+    startSpawnTimer(r);
+
+    emitStateToAll(r);
+
+    // Notify all of the yoink event
+    io.to(r.id).emit("tile:yoinked", {
+      playerId: player.id,
+      playerName: player.name,
+      index,
+      letter: tile,
+    });
+  });
+
+  // ===== word:submit =====
   socket.on("word:submit", (payload: { word: string }) => {
     if (!roomId || !playerId) return;
     const r = rooms.get(roomId);
     if (!r || !r.started) return;
-
-    // server-side throttle (silent on fail to match success-only feed)
     if (!allowSubmit(socket.id)) return;
 
     const word = (payload.word || "").toUpperCase();
 
     if (r.settings.gameMode === "yoink") {
-      // Yoink: validate & consume from player's personal hand immediately
       const player = r.players.get(playerId);
       if (!player) return;
       if (!/^[A-Z]+$/.test(word)) return;
+
       if (word.length < r.settings.minLen) {
         socket.emit("word:rejected", { word, reason: "too short" });
+        return;
+      }
+      if (word.length > 7) {
+        socket.emit("word:rejected", { word, reason: "too long (max 7)" });
         return;
       }
       if (!DICT.has(word)) {
         socket.emit("word:rejected", { word, reason: "not in dictionary" });
         return;
       }
-      if (!canConsumeWord(word, player.hand)) {
-        socket.emit("word:rejected", { word, reason: "not enough tiles" });
+      if (!canConsumeFromBank(word, player.bank)) {
+        socket.emit("word:rejected", { word, reason: "not enough tiles in bank" });
         return;
       }
 
-      consumeWord(word, player.hand);
-      const pts = word.length * word.length; // yoink scoring: length²
+      // Consume from bank
+      player.bank = consumeFromBank(word, player.bank);
+
+      // Score with round multiplier
+      const roundIdx = Math.max(0, r.currentRound - 1);
+      const multiplier = ROUND_MULTIPLIERS[roundIdx] ?? 1.0;
+      const pts = scoreYoinkWord(word, multiplier);
       player.words.push({ word, base: pts });
       player.liveScore += pts;
 
       socket.emit("word:accepted", {
         playerId,
         name: player.name,
+        word,
         letters: word.length,
         points: pts,
-        feed: `${player.name} placed ${word} (${pts} pts)`
+        feed: `${player.name} played ${word} for ${pts} pts`
       });
-      // Send updated hand to this player
-      socket.emit("lobby:state", publicState(r, socket.id));
-      // Broadcast scores to everyone
-      io.to(r.id).emit("scores:update",
-        [...r.players.values()].map(p => ({ id: p.id, name: p.name, score: p.liveScore }))
-      );
+
+      emitStateToAll(r);
       return;
     }
 
@@ -518,69 +693,6 @@ io.on("connection", (socket: Socket) => {
     const key = nowWindowKey(ts, r.shadowWindowMs);
     if (!r.pending.has(key)) r.pending.set(key, []);
     r.pending.get(key)!.push({ ts, socketId: socket.id, playerId, word });
-  });
-
-  // Yoink: draw more tiles from the common bag ("peel") — ALL players draw
-  socket.on("tiles:draw", () => {
-    if (!roomId || !playerId) return;
-    const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
-    if (isBagEmpty(r)) return; // no tiles left
-
-    // PEEL: every player in the room draws tiles
-    for (const p of r.players.values()) {
-      drawTiles(r, p, r.settings.yoinkDrawSize);
-    }
-    emitStateToAll(r);
-  });
-
-  // Yoink: dump 1 tile, draw 3 back
-  socket.on("tiles:dump", (payload: { tile: string }) => {
-    if (!roomId || !playerId) return;
-    const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
-    const player = r.players.get(playerId);
-    if (!player) return;
-
-    const tile = (payload.tile || "").toUpperCase();
-    if (!tile || (player.hand[tile] ?? 0) <= 0) return;
-
-    // Need at least 3 tiles in the bag
-    const available = r.bag.length - r.revealed;
-    if (available < 3) return;
-
-    // Remove tile from hand, put back in bag
-    player.hand[tile]--;
-    if (player.hand[tile] <= 0) delete player.hand[tile];
-    r.bag.push(tile); // append to end of bag
-
-    // Draw 3
-    drawTiles(r, player, 3);
-    socket.emit("lobby:state", publicState(r, socket.id));
-  });
-
-  // Yoink: YOINK! — declare victory
-  socket.on("game:yoink", () => {
-    if (!roomId || !playerId) return;
-    const r = rooms.get(roomId);
-    if (!r || !r.started || r.settings.gameMode !== "yoink") return;
-    const player = r.players.get(playerId);
-    if (!player) return;
-
-    const handCount = countTiles(player.hand);
-    if (handCount === 0) {
-      // Valid YOINK! — player wins with bonus
-      player.liveScore += YOINK_BONUS;
-      clearInterval(r.tick!);
-      r.tick = undefined;
-      r.started = false;
-      finalizeYoinkRound(r, player.id);
-    } else {
-      // Invalid — penalize and continue
-      player.liveScore = Math.max(0, player.liveScore - YOINK_PENALTY);
-      socket.emit("word:rejected", { word: "YOINK!", reason: `hand not empty (${handCount} tiles left) — penalty ${YOINK_PENALTY} pts` });
-      socket.emit("lobby:state", publicState(r, socket.id));
-    }
   });
 
   // --- Settings & Start ---
@@ -603,16 +715,17 @@ io.on("connection", (socket: Socket) => {
     if (typeof partial.roundTiles === "number") {
       r.settings.roundTiles = Math.max(40, Math.min(200, Math.round(partial.roundTiles)));
     }
-    if (typeof partial.yoinkInitialDraw === "number") {
-      r.settings.yoinkInitialDraw = Math.max(7, Math.min(42, Math.round(partial.yoinkInitialDraw)));
+    if (typeof partial.rounds === "number") {
+      r.settings.rounds = Math.max(1, Math.min(5, Math.round(partial.rounds)));
     }
-    if (typeof partial.yoinkDrawSize === "number") {
-      r.settings.yoinkDrawSize = Math.max(1, Math.min(10, Math.round(partial.yoinkDrawSize)));
+    if (typeof partial.roundDurationSec === "number") {
+      r.settings.roundDurationSec = Math.max(15, Math.min(300, Math.round(partial.roundDurationSec)));
+    }
+    if (typeof partial.intermissionSec === "number") {
+      r.settings.intermissionSec = Math.max(3, Math.min(30, Math.round(partial.intermissionSec)));
     }
 
-    // reset surge for next round
     r.settings.surgeAmount = 10;
-
     emitStateToAll(r);
   });
 
@@ -620,7 +733,12 @@ io.on("connection", (socket: Socket) => {
     if (!roomId) return;
     const r = rooms.get(roomId);
     if (!r) return;
-    startRound(r);
+
+    if (r.settings.gameMode === "yoink") {
+      startYoinkGame(r);
+    } else {
+      startClassicRound(r);
+    }
     emitStateToAll(r);
   });
 
@@ -633,7 +751,7 @@ io.on("connection", (socket: Socket) => {
   });
 });
 
-// ===== Listen after dictionary loads =====
+// ===== Listen =====
 const PORT = process.env.PORT || 5177;
 initDictionary().finally(() => {
   server.listen(PORT, () => {

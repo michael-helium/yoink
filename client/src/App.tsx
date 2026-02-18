@@ -1,24 +1,43 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { POINTS, scoreWord, scoreYoinkGrid } from "./lib/scoring";
+import { POINTS, scoreWord, YOINK_POINTS, yoinkPointTier, scoreYoinkWord, ROUND_MULTIPLIERS } from "./lib/scoring";
 
-// ===== Types that mirror server payloads =====
-type ServerState = {
+// ===== Types =====
+type YoinkState = {
   id: string;
   settings: {
-    gameMode: "classic" | "yoink";
+    gameMode: "yoink";
+    rounds: number;
+    roundDurationSec: number;
+    intermissionSec: number;
+    minLen: number;
+    [k: string]: unknown;
+  };
+  gameMode: "yoink";
+  players: { id: string; name: string }[];
+  pool: (string | null)[];
+  bank: string[];
+  myScore: number;
+  endsInMs: number;
+  phase: "lobby" | "playing" | "intermission" | "finished";
+  currentRound: number;
+  totalRounds: number;
+  roundMultiplier: number;
+  scoresHidden: boolean;
+};
+
+type ClassicState = {
+  id: string;
+  settings: {
+    gameMode: "classic";
     durationSec: number;
     minLen: number;
-    uniqueWords: "disallow" | "allow_no_penalty" | "allow_with_decay";
-    decayModel: "linear" | "soft" | "steep";
-    revealModel: string;
+    uniqueWords: string;
+    decayModel: string;
     roundTiles: number;
-    dripPerSec: number;
-    surgeAtSec: number;
-    surgeAmount: number;
-    yoinkInitialDraw: number;
-    yoinkDrawSize: number;
+    [k: string]: unknown;
   };
+  gameMode: "classic";
   players: { id: string; name: string; score: number }[];
   pool: Record<string, number>;
   endsInMs: number;
@@ -28,405 +47,179 @@ type ServerState = {
   hand?: Record<string, number>;
 };
 
+type ServerState = YoinkState | ClassicState;
+
+type RoundEndedEvt = {
+  round: number;
+  totalRounds: number;
+  leaderboard: { id: string; name: string; roundScore: number; cumulativeScore: number }[];
+};
+
+type GameEndedEvt = {
+  leaderboard: { id: string; name: string; roundScore: number; cumulativeScore: number }[];
+};
+
 type AcceptedEvt = {
   playerId: string;
   name: string;
+  word?: string;
   letters: number;
   points: number;
-  feed: string; // "Alex played 5 letters for 37 points."
-};
-
-type EndedEvt = {
-  leaderboard: Array<{
-    id: string;
-    name: string;
-    finalScore: number;
-    details?: Array<{ word: string; base: number; c: number; final: number }>;
-  }>;
+  feed: string;
 };
 
 const NUMBER = new Intl.NumberFormat();
 
-// ===== Offline demo helpers =====
-const COUNTS: Record<string, number> = {
-  "_": 4,
-  E: 24, A: 16, O: 15, T: 15, I: 13, N: 13, R: 13, S: 10, L: 7, U: 7,
-  D: 8, G: 5, C: 6, M: 6, B: 4, P: 4, H: 5, F: 4, W: 4, Y: 4, V: 3,
-  K: 2, J: 2, X: 2, Q: 2, Z: 2,
-};
-function makeBag(): string[] {
-  const bag: string[] = [];
-  for (const [ch, n] of Object.entries(COUNTS)) for (let i = 0; i < n; i++) bag.push(ch);
-  for (let i = bag.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [bag[i], bag[j]] = [bag[j], bag[i]];
-  }
-  return bag;
-}
-function canConsume(word: string, pool: Record<string, number>): boolean {
-  const need: Record<string, number> = {};
-  for (const ch of word) need[ch] = (need[ch] ?? 0) + 1;
-  const have = { ...pool };
-  for (const ch of Object.keys(need)) {
-    const take = Math.min(need[ch], have[ch] ?? 0);
-    need[ch] -= take;
-    have[ch] = (have[ch] ?? 0) - take;
-  }
-  const remain = Object.values(need).reduce((s, c) => s + c, 0);
-  return (have["_"] ?? 0) >= remain;
-}
-function consume(word: string, pool: Record<string, number>): Record<string, number> {
-  const next = { ...pool };
-  for (const ch of word) {
-    if ((next[ch] ?? 0) > 0) next[ch]!--;
-    else if ((next["_"] ?? 0) > 0) next["_"]!--;
-  }
-  return next;
+// Tile background color by point tier
+function tileBg(letter: string | null): string {
+  if (!letter) return "bg-neutral-800";
+  const tier = yoinkPointTier(letter);
+  if (tier === 30) return "bg-yellow-500/30 ring-1 ring-yellow-400";
+  if (tier === 20) return "bg-blue-500/20 ring-1 ring-blue-400/50";
+  return "bg-neutral-900";
 }
 
 export default function App() {
-  // ---- Connection & lobby UI state ----
+  // Connection
   const [room, setRoom] = useState("test");
-  const [name, setName] = useState("Michael");
+  const [name, setName] = useState("");
   const [connected, setConnected] = useState(false);
-  const [offlineSim, setOfflineSim] = useState(false);
+  const [joined, setJoined] = useState(false);
   const sockRef = useRef<Socket | null>(null);
 
-  // ---- Live server state & events ----
+  // State
   const [state, setState] = useState<ServerState | null>(null);
-  const [finals, setFinals] = useState<EndedEvt["leaderboard"] | null>(null);
   const [feed, setFeed] = useState<string[]>([]);
-  const [input, setInput] = useState("");
-  const [dumpTile, setDumpTile] = useState("");
   const [rejection, setRejection] = useState<string | null>(null);
 
-  // ---- Game mode (offline) ----
-  const [gameMode, setGameMode] = useState<"classic" | "yoink">("yoink");
+  // Yoink word builder
+  const [selectedIndices, setSelectedIndices] = useState<number[]>([]); // indices into bank
+  const [lastPointsEarned, setLastPointsEarned] = useState<number | null>(null);
+  const [yoinkedIndex, setYoinkedIndex] = useState<number | null>(null);
+  const [shakeSubmit, setShakeSubmit] = useState(false);
 
-  // ---- Offline demo round state ----
-  const [timeLeft, setTimeLeft] = useState(120);
-  const [pool, setPool] = useState<Record<string, number>>({});
-  const [hand, setHand] = useState<Record<string, number>>({}); // yoink personal hand
-  const [revealed, setRevealed] = useState(0);
-  const roundTiles = 100;
-  const dripPerSec = 2;
-  const surgeAt = 60;
-  const [surgeUsed, setSurgeUsed] = useState(false);
-  const [myScore, setMyScore] = useState(0);
-  const [myWords, setMyWords] = useState<string[]>([]);
-  const bagRef = useRef<string[]>([]);
-  const timerRef = useRef<number | null>(null);
-  const revealedRef = useRef(0);
+  // Round flow
+  const [roundLeaderboard, setRoundLeaderboard] = useState<RoundEndedEvt | null>(null);
+  const [finalLeaderboard, setFinalLeaderboard] = useState<GameEndedEvt | null>(null);
 
-  // ---- Client-side rate limit to mirror server: 5/sec, burst 10 ----
-  const bucket = useRef({ tokens: 10, last: Date.now() });
-  function canClientSubmit(): boolean {
-    const now = Date.now();
-    const elapsed = (now - bucket.current.last) / 1000;
-    bucket.current.last = now;
-    bucket.current.tokens = Math.min(10, bucket.current.tokens + elapsed * 5);
-    if (bucket.current.tokens >= 1) {
-      bucket.current.tokens -= 1;
-      return true;
-    }
-    return false;
-  }
-
-  // ---- Connect to multiplayer server OR fall back to offline demo ----
+  // Connect
   function connect() {
-    // If no server URL configured, go offline immediately
     const url = import.meta.env.VITE_SOCKET_URL || "";
-    if (!url) {
-      setOfflineSim(true);
-      return;
-    }
-
-    const s = io(url, { transports: ["websocket"], timeout: 1500 });
+    if (!url) return;
+    const s = io(url, { transports: ["websocket"], timeout: 3000 });
     sockRef.current = s;
 
-    // Fallback timer if we can't connect quickly
-    const fallbackTimer = window.setTimeout(() => {
-      if (!s.connected) setOfflineSim(true);
-    }, 1500);
-
     s.on("connect", () => {
-      clearTimeout(fallbackTimer);
       setConnected(true);
-      s.emit("lobby:join", {
-        room: room.trim() || "test",
-        name: name.trim() || "Player",
-      });
+      s.emit("lobby:join", { room: room.trim() || "test", name: name.trim() || "Player" });
+      setJoined(true);
     });
 
-    s.on("lobby:state", (st: ServerState) => setState(st));
-    s.on("word:accepted", (evt: AcceptedEvt) =>
-      setFeed((prev) => [evt.feed, ...prev].slice(0, 10))
-    );
-    s.on("round:ended", (evt: EndedEvt) => setFinals(evt.leaderboard));
-    s.on("word:rejected", (evt: { word: string; reason: string }) => {
-      setRejection(`"${evt.word}" rejected: ${evt.reason}`);
-      setTimeout(() => setRejection(null), 3000);
+    s.on("lobby:state", (st: ServerState) => {
+      setState(st);
+      // Clear round leaderboard when playing starts
+      if ("phase" in st && st.phase === "playing") setRoundLeaderboard(null);
     });
+
+    s.on("word:accepted", (evt: AcceptedEvt) => {
+      setFeed(prev => [evt.feed, ...prev].slice(0, 10));
+      if (evt.playerId === s.id) {
+        setLastPointsEarned(evt.points);
+        setTimeout(() => setLastPointsEarned(null), 2000);
+      }
+    });
+
+    s.on("word:rejected", (evt: { word: string; reason: string }) => {
+      setRejection(`"${evt.word}" — ${evt.reason}`);
+      setShakeSubmit(true);
+      setTimeout(() => { setRejection(null); setShakeSubmit(false); }, 2000);
+    });
+
+    s.on("yoink:rejected", (evt: { reason: string }) => {
+      // silent for now
+    });
+
+    s.on("tile:yoinked", (evt: { playerId: string; index: number }) => {
+      if (evt.playerId === s.id) {
+        setYoinkedIndex(evt.index);
+        setTimeout(() => setYoinkedIndex(null), 400);
+      }
+    });
+
+    s.on("round:ended", (evt: RoundEndedEvt) => {
+      setRoundLeaderboard(evt);
+      setSelectedIndices([]);
+    });
+
+    s.on("game:ended", (evt: GameEndedEvt) => {
+      setFinalLeaderboard(evt);
+      setSelectedIndices([]);
+    });
+
     s.on("disconnect", () => {
       setConnected(false);
       setState(null);
+      setJoined(false);
     });
   }
 
-  // ---- Offline demo round control ----
-  // ---- Offline yoink: draw from bag into hand ----
-  function offlineDrawTiles(count: number) {
-    setRevealed((rev) => {
-      const bag = bagRef.current;
-      const avail = bag.length - rev;
-      const take = Math.min(count, avail);
-      if (take <= 0) return rev;
-      const tiles = bag.slice(rev, rev + take);
-      setHand((h) => {
-        const next = { ...h };
-        for (const ch of tiles) next[ch] = (next[ch] ?? 0) + 1;
-        return next;
-      });
-      revealedRef.current = rev + take;
-      return rev + take;
+  // Yoink a tile from pool
+  function yoinkTile(index: number) {
+    sockRef.current?.emit("tile:yoink", { index });
+  }
+
+  // Toggle bank letter selection
+  function toggleBankLetter(bankIndex: number) {
+    setSelectedIndices(prev => {
+      if (prev.includes(bankIndex)) return prev.filter(i => i !== bankIndex);
+      return [...prev, bankIndex];
     });
   }
 
-  // Keep ref in sync
-  useEffect(() => { revealedRef.current = revealed; }, [revealed]);
+  // Build word from selected
+  const bank = (state as YoinkState)?.bank ?? [];
+  const assembledWord = selectedIndices.map(i => bank[i]).join("");
 
-  function startOfflineRound() {
-    setFeed([]);
-    setMyScore(0);
-    setMyWords([]);
-    setPool({});
-    setHand({});
-    setRevealed(0);
-    setSurgeUsed(false);
-    setTimeLeft(120);
-    bagRef.current = makeBag();
-
-    if (gameMode === "yoink") {
-      // Deal 21 tiles to hand instantly
-      const initial = bagRef.current.slice(0, 21);
-      const startHand: Record<string, number> = {};
-      for (const ch of initial) startHand[ch] = (startHand[ch] ?? 0) + 1;
-      setHand(startHand);
-      setRevealed(21);
-
-      revealedRef.current = 21;
-      timerRef.current && clearInterval(timerRef.current);
-      timerRef.current = window.setInterval(() => {
-        setTimeLeft((t) => {
-          if (t <= 1) {
-            clearInterval(timerRef.current!);
-            return 0;
-          }
-          return t - 1;
-        });
-      }, 1000) as unknown as number;
-      return;
-    }
-
-    // ---- Yoink offline (original) ----
-    const open = Math.min(20, roundTiles);
-    const initial = bagRef.current.slice(0, open);
-    const startPool: Record<string, number> = {};
-    for (const ch of initial) startPool[ch] = (startPool[ch] ?? 0) + 1;
-    setPool(startPool);
-    setRevealed(open);
-
-    timerRef.current && clearInterval(timerRef.current);
-    timerRef.current = window.setInterval(() => {
-      setTimeLeft((t) => {
-        if (t <= 1) {
-          clearInterval(timerRef.current!);
-          setFinals([
-            {
-              id: "me",
-              name,
-              finalScore: myScore,
-              details: myWords.map((w) => ({
-                word: w,
-                base: scoreWord(w),
-                c: 1,
-                final: scoreWord(w),
-              })),
-            },
-          ]);
-          return 0;
-        }
-        return t - 1;
-      });
-
-      // Drip
-      setPool((prev) => {
-        setRevealed((r) => {
-          if (r >= roundTiles) return r;
-          const take = Math.min(dripPerSec, roundTiles - r);
-          const more = bagRef.current.slice(r, r + take);
-          const next = { ...prev };
-          for (const ch of more) next[ch] = (next[ch] ?? 0) + 1;
-          return r + take;
-        });
-        return prev;
-      });
-
-      // One-time surge
-      setTimeout(() => {
-        setSurgeUsed((done) => {
-          if (done) return true;
-          const elapsed = 120 - (timeLeft - 1);
-          if (elapsed >= surgeAt) {
-            setPool((prev) => {
-              setRevealed((r) => {
-                const take = Math.min(10, roundTiles - r);
-                const more = bagRef.current.slice(r, r + take);
-                const n = { ...prev };
-                for (const ch of more) n[ch] = (n[ch] ?? 0) + 1;
-                return r + take;
-              });
-              return prev;
-            });
-            return true;
-          }
-          return false;
-        });
-      }, 0);
-    }, 1000) as unknown as number;
+  // Submit word
+  function submitWord() {
+    if (!assembledWord || assembledWord.length < (state?.settings?.minLen ?? 3)) return;
+    sockRef.current?.emit("word:submit", { word: assembledWord });
+    setSelectedIndices([]);
   }
 
-  // ---- Build a flat, randomized tile list for display ----
-  const currentMode = offlineSim ? gameMode : (state?.settings.gameMode ?? "yoink");
-  const tiles = useMemo(() => {
-    let src: Record<string, number>;
-    if (offlineSim) {
-      src = currentMode === "yoink" ? hand : pool;
-    } else {
-      src = currentMode === "yoink" ? (state?.hand || {}) : (state?.pool || {});
-    }
-    const arr: string[] = [];
-    for (const [ch, count] of Object.entries(src)) {
-      for (let i = 0; i < (count ?? 0); i++) arr.push(ch);
-    }
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  }, [offlineSim, pool, hand, state?.pool, state?.hand, currentMode]);
+  // Derived
+  const isYoink = state?.gameMode === "yoink";
+  const seconds = Math.ceil((state?.endsInMs ?? 0) / 1000);
+  const phase = (state as YoinkState)?.phase ?? "lobby";
+  const currentRound = (state as YoinkState)?.currentRound ?? 0;
+  const totalRounds = (state as YoinkState)?.totalRounds ?? 3;
+  const roundMultiplier = (state as YoinkState)?.roundMultiplier ?? 1.0;
+  const myScore = (state as YoinkState)?.myScore ?? 0;
+  const pool = (state as YoinkState)?.pool ?? [];
 
-  // ---- Submit handler (works online & offline) ----
-  function submit() {
-    const w = input.trim().toUpperCase();
-    if (!w || !/^[A-Z]+$/.test(w)) return; // success-only
-    if (!canClientSubmit()) return;
-
-    if (offlineSim) {
-      if (w.length < 3) return;
-
-      if (gameMode === "yoink") {
-        if (!canConsume(w, hand)) return;
-        const pts = w.length * w.length;
-        setMyScore((s) => s + pts);
-        setMyWords((ws) => [...ws, w]);
-        setHand((h) => consume(w, h));
-        setFeed((prev) => [`${name} placed ${w} (${pts} pts)`, ...prev].slice(0, 10));
-        setInput("");
-        return;
-      }
-
-      if (!canConsume(w, pool)) return;
-      const pts = scoreWord(w);
-      setMyScore((s) => s + pts);
-      setMyWords((ws) => [...ws, w]);
-      setPool((p) => consume(w, p));
-      setFeed((prev) => [`${name} played ${w.length} letters for ${pts} points.`, ...prev].slice(0, 10));
-      setInput("");
-      return;
-    }
-
-    if (!connected) return;
-    sockRef.current?.emit("word:submit", { word: w });
-    setInput("");
-  }
-
-  // ---- YOINK! handler ----
-  function handleYoink() {
-    if (offlineSim) {
-      const handCount = Object.values(hand).reduce((s, n) => s + n, 0);
-      if (handCount === 0) {
-        const bonus = 50;
-        const finalScore = myScore + bonus;
-        clearInterval(timerRef.current!);
-        setTimeLeft(0);
-        setFinals([{ id: "me", name, finalScore }]);
-      }
-      return;
-    }
-    sockRef.current?.emit("game:yoink");
-  }
-
-  // ---- DUMP handler ----
-  function handleDump() {
-    const tile = dumpTile.trim().toUpperCase();
-    if (!tile) return;
-    if (offlineSim) {
-      if ((hand[tile] ?? 0) <= 0) return;
-      const bag = bagRef.current;
-      const avail = bag.length - revealedRef.current;
-      if (avail < 3) return;
-      // Remove tile from hand, put back in bag
-      setHand((h) => {
-        const next = { ...h };
-        next[tile] = (next[tile] ?? 0) - 1;
-        if (next[tile]! <= 0) delete next[tile];
-        return next;
-      });
-      bagRef.current.push(tile);
-      offlineDrawTiles(3);
-      setDumpTile("");
-      return;
-    }
-    sockRef.current?.emit("tiles:dump", { tile });
-    setDumpTile("");
-  }
-
-  // ---- Derived UI bits ----
-  const bagRemaining = offlineSim
-    ? bagRef.current.length - revealed
-    : (state?.bagRemaining ?? 0);
-  const tilesText = currentMode === "yoink"
-    ? `Bag: ${bagRemaining} left`
-    : offlineSim
-      ? `${revealed}/${roundTiles}`
-      : `${state?.revealed ?? 0}/${state?.roundTiles ?? 0}`;
-  const seconds = offlineSim ? timeLeft : Math.ceil((state?.endsInMs ?? 0) / 1000);
-  const playersCount = offlineSim ? 1 : (state?.players.length ?? 0);
+  // Round bonus text
+  const bonusText = roundMultiplier > 1 ? `${Math.round((roundMultiplier - 1) * 100)}% bonus!` : "";
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* Header / Lobby */}
+    <div className="min-h-screen flex flex-col bg-neutral-950 text-white">
+      {/* Header */}
       <header className="p-4 border-b border-neutral-800">
-        <h1 className="text-2xl font-semibold">YOINK</h1>
-        <p className="text-neutral-400 text-sm">
-          {currentMode === "yoink" ? "YOINK — build your words!" : "Shared-pool speed word game"}
-        </p>
+        <h1 className="text-3xl font-black tracking-tight">🫳 YOINK!</h1>
 
-        {/* Join controls (when not connected and not in offline demo) */}
-        {!connected && !offlineSim && (
+        {/* Join controls */}
+        {!joined && (
           <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
             <input
               className="rounded-xl bg-neutral-800 px-3 py-2 outline-none"
               placeholder="Room code"
               value={room}
-              onChange={(e) => setRoom(e.target.value)}
+              onChange={e => setRoom(e.target.value)}
             />
             <input
               className="rounded-xl bg-neutral-800 px-3 py-2 outline-none"
               placeholder="Your name"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={e => setName(e.target.value)}
             />
             <button className="rounded-xl bg-indigo-500 px-3 py-2 font-semibold" onClick={connect}>
               Join
@@ -434,199 +227,258 @@ export default function App() {
           </div>
         )}
 
-        {/* Offline demo controls (if server missing/unreachable) */}
-        {offlineSim && (
-          <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-4 items-end">
-            <label className="text-xs text-neutral-400 sm:col-span-2">
-              Your name
-              <input
-                className="w-full mt-1 rounded-xl bg-neutral-800 px-3 py-2 outline-none"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </label>
-            <label className="text-xs text-neutral-400">
-              Mode
-              <select
-                className="w-full mt-1 rounded-xl bg-neutral-800 px-3 py-2 outline-none"
-                value={gameMode}
-                onChange={(e) => setGameMode(e.target.value as "classic" | "yoink")}
-              >
-                <option value="classic">Classic</option>
-                <option value="yoink">Yoink</option>
-              </select>
-            </label>
-            <button className="rounded-xl bg-amber-500 px-3 py-2 font-semibold" onClick={startOfflineRound}>
-              Play offline demo
-            </button>
-            <div className="sm:col-span-4 text-xs text-amber-300 mt-1">
-              Server not reachable — playing offline on your device.
-            </div>
-          </div>
-        )}
-
-        {/* Settings panel (visible only when connected to server multiplayer) */}
-        {connected && !offlineSim && (
-          <div className="mt-3 grid grid-cols-1 sm:grid-cols-5 gap-2 items-end">
-            <label className="text-xs text-neutral-400">
-              Mode
-              <select
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.gameMode ?? "yoink"}
-                onChange={(e) => sockRef.current?.emit("settings:update", { gameMode: e.target.value })}
-              >
-                <option value="classic">Classic</option>
-                <option value="yoink">Yoink</option>
-              </select>
-            </label>
-
-            <label className="text-xs text-neutral-400">
-              Round (s)
-              <input
-                type="number"
-                min={30}
-                max={600}
-                step={30}
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.durationSec ?? 120}
-                onBlur={(e) => sockRef.current?.emit("settings:update", { durationSec: Number(e.target.value) })}
-              />
-            </label>
-
-            <label className="text-xs text-neutral-400">
-              Min len
-              <select
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.minLen ?? 3}
-                onChange={(e) => sockRef.current?.emit("settings:update", { minLen: Number(e.target.value) })}
-              >
-                {[2, 3, 4, 5, 6].map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="text-xs text-neutral-400">
-              Duplicates
-              <select
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.uniqueWords ?? "allow_with_decay"}
-                onChange={(e) => sockRef.current?.emit("settings:update", { uniqueWords: e.target.value })}
-              >
-                <option value="disallow">Disallow</option>
-                <option value="allow_no_penalty">Allow (no penalty)</option>
-                <option value="allow_with_decay">Allow (decay)</option>
-              </select>
-            </label>
-
-            <label className="text-xs text-neutral-400">
-              Decay
-              <select
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.decayModel ?? "linear"}
-                onChange={(e) => sockRef.current?.emit("settings:update", { decayModel: e.target.value })}
-              >
-                <option value="linear">Linear</option>
-                <option value="soft">Soft</option>
-                <option value="steep">Steep</option>
-              </select>
-            </label>
-
-            <label className="text-xs text-neutral-400">
-              Tiles
-              <input
-                type="number"
-                min={40}
-                max={200}
-                step={10}
-                className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
-                defaultValue={state?.settings.roundTiles ?? 100}
-                onBlur={(e) => sockRef.current?.emit("settings:update", { roundTiles: Number(e.target.value) })}
-              />
-            </label>
-
-            <div className="sm:col-span-5 flex justify-end">
+        {/* Settings (when in lobby, connected) */}
+        {joined && isYoink && phase === "lobby" && (
+          <div className="mt-3 flex flex-col gap-2">
+            <p className="text-neutral-400 text-sm">Waiting in lobby... Host can start the game.</p>
+            <div className="flex gap-2 items-end flex-wrap">
+              <label className="text-xs text-neutral-400">
+                Mode
+                <select
+                  className="w-full mt-1 rounded-lg bg-neutral-800 px-3 py-2 outline-none"
+                  defaultValue="yoink"
+                  onChange={e => sockRef.current?.emit("settings:update", { gameMode: e.target.value })}
+                >
+                  <option value="yoink">Yoink</option>
+                  <option value="classic">Classic</option>
+                </select>
+              </label>
               <button
-                className="mt-2 rounded-xl bg-indigo-500 px-4 py-2 font-semibold"
+                className="rounded-xl bg-indigo-500 px-4 py-2 font-semibold"
                 onClick={() => sockRef.current?.emit("game:start")}
               >
-                Start new round
+                Start Game
               </button>
             </div>
           </div>
         )}
       </header>
 
-      {/* Top status bar */}
+      {/* ===== YOINK MODE GAMEPLAY ===== */}
+      {joined && isYoink && phase === "playing" && (
+        <>
+          {/* Top bar */}
+          <div className="px-4 py-2 flex items-center justify-between border-b border-neutral-800">
+            <div className="text-sm font-semibold text-indigo-400">
+              Round {currentRound}/{totalRounds}
+              {bonusText && <span className="ml-2 text-yellow-400">⚡ {bonusText}</span>}
+            </div>
+            <div className="text-2xl font-mono font-bold tabular-nums">{seconds}s</div>
+            <div className="text-sm">
+              Your score: <span className="font-bold text-emerald-400">{NUMBER.format(myScore)}</span>
+            </div>
+          </div>
+
+          {/* Points earned flash */}
+          {lastPointsEarned !== null && (
+            <div className="text-center py-1 text-emerald-400 font-bold text-lg animate-bounce">
+              +{lastPointsEarned} pts!
+            </div>
+          )}
+
+          {/* 4×4 Pool Grid */}
+          <section className="px-4 py-3">
+            <div className="grid grid-cols-4 gap-2 max-w-xs mx-auto">
+              {pool.map((tile, i) => (
+                <button
+                  key={i}
+                  className={`relative aspect-square rounded-xl flex items-center justify-center text-2xl font-bold transition-all
+                    ${tile ? `${tileBg(tile)} active:scale-90 cursor-pointer hover:brightness-125` : "bg-neutral-800/40 cursor-default"}
+                    ${yoinkedIndex === i ? "scale-75 opacity-50" : ""}`}
+                  onClick={() => tile && yoinkTile(i)}
+                  disabled={!tile}
+                >
+                  {tile ?? ""}
+                  {tile && (
+                    <span className="absolute bottom-0.5 right-1 text-[0.55rem] font-semibold text-neutral-400">
+                      {YOINK_POINTS[tile] ?? 0}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          {/* Word builder preview */}
+          <section className="px-4">
+            <div className="text-center min-h-[2.5rem] flex items-center justify-center gap-1">
+              {assembledWord ? (
+                <span className="text-2xl font-bold tracking-widest text-white">
+                  {assembledWord}
+                </span>
+              ) : (
+                <span className="text-neutral-500 text-sm">Tap bank letters to build a word</span>
+              )}
+            </div>
+          </section>
+
+          {/* Personal Bank (7 slots) */}
+          <section className="px-4 py-2">
+            <div className="flex justify-center gap-2">
+              {Array.from({ length: 7 }).map((_, i) => {
+                const letter = bank[i] ?? null;
+                const isSelected = selectedIndices.includes(i);
+                return (
+                  <button
+                    key={i}
+                    className={`w-11 h-11 rounded-lg flex items-center justify-center text-lg font-bold transition-all
+                      ${!letter ? "bg-neutral-800/30 border border-dashed border-neutral-700" : ""}
+                      ${letter && !isSelected ? `${tileBg(letter)} cursor-pointer hover:brightness-125` : ""}
+                      ${letter && isSelected ? "bg-indigo-500 ring-2 ring-indigo-300 scale-90" : ""}`}
+                    onClick={() => letter && toggleBankLetter(i)}
+                    disabled={!letter}
+                  >
+                    {letter && (
+                      <>
+                        {letter}
+                      </>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* Action buttons */}
+          <section className="px-4 py-2 flex justify-center gap-3">
+            <button
+              className="rounded-xl bg-neutral-700 px-4 py-2 text-sm font-semibold"
+              onClick={() => setSelectedIndices([])}
+              disabled={selectedIndices.length === 0}
+            >
+              Clear
+            </button>
+            <button
+              className={`rounded-xl px-6 py-2 text-sm font-bold transition-all
+                ${assembledWord.length >= (state?.settings?.minLen ?? 3)
+                  ? "bg-emerald-500 hover:bg-emerald-400"
+                  : "bg-neutral-700 text-neutral-400"}
+                ${shakeSubmit ? "animate-pulse bg-red-500" : ""}`}
+              onClick={submitWord}
+              disabled={assembledWord.length < (state?.settings?.minLen ?? 3)}
+            >
+              Submit
+            </button>
+          </section>
+
+          {/* Feed */}
+          <section className="px-4 py-2 mt-auto">
+            <ul className="space-y-0.5">
+              {feed.slice(0, 5).map((f, i) => (
+                <li key={i} className="text-xs text-neutral-500">{f}</li>
+              ))}
+            </ul>
+          </section>
+        </>
+      )}
+
+      {/* ===== INTERMISSION (between rounds) ===== */}
+      {joined && isYoink && phase === "intermission" && roundLeaderboard && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6">
+          <h2 className="text-xl font-bold mb-1">Round {roundLeaderboard.round} Complete!</h2>
+          <p className="text-neutral-400 text-sm mb-4">Next round starting in {seconds}s...</p>
+          <div className="w-full max-w-sm">
+            {roundLeaderboard.leaderboard.map((p, idx) => {
+              const isLeader = idx === 0;
+              return (
+                <div key={p.id} className="flex justify-between py-2 border-b border-neutral-800">
+                  <span>
+                    {isLeader && "👑 "}{idx + 1}. {p.name}
+                  </span>
+                  <span className="font-bold">
+                    {NUMBER.format(p.cumulativeScore)}
+                    <span className="text-neutral-500 text-xs ml-1">(+{p.roundScore})</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ===== FINISHED (game over) ===== */}
+      {joined && isYoink && (phase === "finished" || finalLeaderboard) && finalLeaderboard && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6">
+          <h2 className="text-2xl font-black mb-4">🏆 Game Over!</h2>
+          <div className="w-full max-w-sm">
+            {finalLeaderboard.leaderboard.map((p, idx) => {
+              const isLeader = idx === 0;
+              return (
+                <div key={p.id} className={`flex justify-between py-3 border-b border-neutral-800 ${isLeader ? "text-yellow-400" : ""}`}>
+                  <span className="font-semibold">
+                    {isLeader && "👑 "}{idx + 1}. {p.name}
+                  </span>
+                  <span className="font-bold text-lg">{NUMBER.format(p.cumulativeScore)}</span>
+                </div>
+              );
+            })}
+          </div>
+          <button
+            className="mt-6 rounded-xl bg-indigo-500 px-6 py-3 font-semibold"
+            onClick={() => {
+              setFinalLeaderboard(null);
+              setRoundLeaderboard(null);
+              setFeed([]);
+              sockRef.current?.emit("game:start");
+            }}
+          >
+            Play Again
+          </button>
+        </div>
+      )}
+
+      {/* ===== CLASSIC MODE (unchanged) ===== */}
+      {joined && !isYoink && state && (
+        <ClassicModeUI state={state as ClassicState} sockRef={sockRef} name={name} />
+      )}
+
+      {/* Rejection toast */}
+      {rejection && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-semibold z-50 animate-pulse">
+          {rejection}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===== Classic Mode UI (preserved from original) =====
+function ClassicModeUI({ state, sockRef, name }: { state: ClassicState; sockRef: React.MutableRefObject<Socket | null>; name: string }) {
+  const [input, setInput] = useState("");
+  const [feed, setFeed] = useState<string[]>([]);
+  const seconds = Math.ceil((state?.endsInMs ?? 0) / 1000);
+
+  const tiles = React.useMemo(() => {
+    const arr: string[] = [];
+    for (const [ch, count] of Object.entries(state.pool)) {
+      for (let i = 0; i < (count ?? 0); i++) arr.push(ch);
+    }
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }, [state.pool]);
+
+  function submit() {
+    const w = input.trim().toUpperCase();
+    if (!w || !/^[A-Z]+$/.test(w)) return;
+    sockRef.current?.emit("word:submit", { word: w });
+    setInput("");
+  }
+
+  return (
+    <>
       <div className="px-4 py-2 flex items-center justify-between">
-        <div className="text-lg font-mono">{Number.isFinite(seconds) ? seconds : "--"}s</div>
-        <div className="text-sm text-neutral-400">Tiles: {tilesText}</div>
-        <div className="text-sm text-neutral-400">Players: {playersCount}</div>
+        <div className="text-lg font-mono">{seconds}s</div>
+        <div className="text-sm text-neutral-400">Tiles: {state.revealed}/{state.roundTiles}</div>
+        <div className="text-sm text-neutral-400">Players: {state.players.length}</div>
       </div>
 
-      {/* Pool / Hand tiles */}
       <section className="px-4">
-        {currentMode === "yoink" && (
-          <div className="mb-2 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-lg font-bold">🖐️ Hand: {tiles.length} tiles</span>
-              <div className="flex gap-2 items-center">
-                <button
-                  className="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold"
-                  onClick={() => {
-                    if (offlineSim) {
-                      offlineDrawTiles(3);
-                    } else {
-                      sockRef.current?.emit("tiles:draw");
-                    }
-                  }}
-                  disabled={seconds <= 0 || bagRemaining <= 0}
-                >
-                  Peel 🍌
-                </button>
-                <input
-                  className="w-10 rounded-lg bg-neutral-800 px-2 py-1 text-sm text-center outline-none uppercase"
-                  placeholder="?"
-                  maxLength={1}
-                  value={dumpTile}
-                  onChange={(e) => setDumpTile(e.target.value)}
-                />
-                <button
-                  className="rounded-lg bg-orange-600 px-3 py-1 text-sm font-semibold"
-                  onClick={handleDump}
-                  disabled={seconds <= 0 || bagRemaining < 3}
-                >
-                  Dump
-                </button>
-              </div>
-            </div>
-            <button
-              className={`w-full rounded-xl px-4 py-3 text-lg font-bold transition-all ${
-                tiles.length === 0 && seconds > 0
-                  ? "bg-yellow-400 text-black animate-pulse"
-                  : "bg-neutral-700 text-neutral-400"
-              }`}
-              onClick={handleYoink}
-              disabled={tiles.length !== 0 || seconds <= 0}
-            >
-              🫳 YOINK! 🫳
-            </button>
-            {offlineSim && (
-              <div className="text-xs text-amber-300">⚠️ Offline mode — no dictionary check</div>
-            )}
-          </div>
-        )}
-        <div
-          className="grid gap-2"
-          style={{ gridTemplateColumns: "repeat(auto-fill, minmax(56px, 1fr))" }}
-        >
+        <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(56px, 1fr))" }}>
           {tiles.map((ch, i) => (
-            <div
-              key={`${ch}-${i}`}
-              className="relative aspect-square rounded-lg bg-neutral-900 flex items-center justify-center text-2xl font-bold"
-            >
+            <div key={`${ch}-${i}`} className="relative aspect-square rounded-lg bg-neutral-900 flex items-center justify-center text-2xl font-bold">
               {ch === "_" ? "␣" : ch}
               <span className="absolute bottom-1 right-1 text-[0.6rem] font-semibold text-neutral-400">
                 {POINTS[ch] ?? 0}
@@ -636,101 +488,32 @@ export default function App() {
         </div>
       </section>
 
-      {/* Input */}
       <section className="px-4 mt-auto pb-3">
         <div className="flex gap-2">
           <input
             className="flex-1 rounded-2xl bg-neutral-900 px-4 py-3 text-lg outline-none"
             placeholder="type a word…"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && submit()}
-            disabled={(!connected && !offlineSim) || seconds <= 0}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()}
           />
-          <button
-            className="rounded-2xl bg-indigo-500 px-4 py-3 text-lg font-semibold"
-            onClick={submit}
-            disabled={(!connected && !offlineSim) || seconds <= 0}
-          >
+          <button className="rounded-2xl bg-indigo-500 px-4 py-3 text-lg font-semibold" onClick={submit}>
             Play
           </button>
         </div>
-        <div className="text-xs text-neutral-500 mt-2">
-          Success-only feed • 5 submits/sec rate limit • blanks are ␣ (0 pts)
-        </div>
       </section>
 
-      {/* Scores */}
       <section className="px-4 pb-4">
-        <div className="text-sm text-neutral-400 mb-1">Scores (live)</div>
+        <div className="text-sm text-neutral-400 mb-1">Scores</div>
         <ul className="space-y-1">
-          {offlineSim ? (
-            <li className="flex justify-between">
-              <span>{name}</span>
-              <span className="font-semibold">{NUMBER.format(myScore)}</span>
-            </li>
-          ) : (
-            state?.players
-              .slice()
-              .sort((a, b) => b.score - a.score)
-              .map((p) => (
-                <li key={p.id} className="flex justify-between">
-                  <span>{p.name}</span>
-                  <span className="font-semibold">{NUMBER.format(p.score)}</span>
-                </li>
-              ))
-          )}
-        </ul>
-      </section>
-
-      {/* Feed */}
-      <section className="px-4 pb-6">
-        <div className="text-sm text-neutral-400 mb-1">Recent</div>
-        <ul className="space-y-1">
-          {feed.map((f, i) => (
-            <li key={i} className="text-sm">
-              {f}
+          {state.players.slice().sort((a, b) => b.score - a.score).map(p => (
+            <li key={p.id} className="flex justify-between">
+              <span>{p.name}</span>
+              <span className="font-semibold">{NUMBER.format(p.score)}</span>
             </li>
           ))}
         </ul>
       </section>
-
-      {/* Rejection toast */}
-      {rejection && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-semibold z-50 animate-pulse">
-          {rejection}
-        </div>
-      )}
-
-      {/* Final leaderboard modal */}
-      {finals && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-2xl bg-neutral-900 p-4">
-            <div className="text-lg font-semibold mb-2">Final scores</div>
-            <ul className="space-y-2">
-              {finals.map((p, idx) => (
-                <li key={p.id} className="flex justify-between">
-                  <span>
-                    {idx + 1}. {p.name}
-                  </span>
-                  <span className="font-bold">{NUMBER.format(p.finalScore)}</span>
-                </li>
-              ))}
-            </ul>
-            <button
-              className="mt-4 w-full rounded-xl bg-neutral-200 text-neutral-900 px-3 py-2 font-semibold"
-              onClick={() => setFinals(null)}
-            >
-              Close
-            </button>
-            <div className="mt-2 text-xs text-neutral-400">
-              {offlineSim
-                ? "Offline demo uses a local tile bag."
-                : "Includes duplicate decay if enabled by host."}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
+    </>
   );
 }
