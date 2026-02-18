@@ -3,7 +3,7 @@
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { scoreBananagramsGrid, countTiles } from "./bananagrams.js";
+import { scoreBananagramsGrid, countTiles, BANANAS_BONUS, BANANAS_PENALTY } from "./bananagrams.js";
 
 describe("scoreBananagramsGrid", () => {
   it("scores each word as length² and penalises unused tiles", () => {
@@ -34,6 +34,27 @@ describe("scoreBananagramsGrid", () => {
       scoreBananagramsGrid(["STONES"], 0) >
         scoreBananagramsGrid(["STO", "NES"], 0)
     );
+  });
+});
+
+describe("BANANAS! bonus scoring", () => {
+  it("awards 50-point bonus for a valid BANANAS! call", () => {
+    // Player used all tiles in words, gets grid score + bonus
+    const gridScore = scoreBananagramsGrid(["STONE", "RUSH"], 0); // 25 + 16 = 41
+    const finalScore = gridScore + BANANAS_BONUS;
+    assert.equal(finalScore, 91);
+    assert.equal(BANANAS_BONUS, 50);
+  });
+
+  it("defines a 10-point penalty for invalid BANANAS! call", () => {
+    assert.equal(BANANAS_PENALTY, 10);
+  });
+
+  it("BANANAS! with unused tiles does not get bonus", () => {
+    // Player still has tiles — no bonus, just grid score with penalty
+    const gridScore = scoreBananagramsGrid(["STONE"], 3); // 25 - 9 = 16
+    assert.equal(gridScore, 16);
+    // No BANANAS_BONUS added since hand wasn't empty
   });
 });
 

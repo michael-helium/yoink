@@ -2,7 +2,7 @@ import express from "express";
 import http from "http";
 import { Server, Socket } from "socket.io";
 import { loadWordlists } from "./dict";
-import { scoreBananagramsGrid, countTiles } from "./bananagrams";
+import { scoreBananagramsGrid, countTiles, BANANAS_BONUS, BANANAS_PENALTY } from "./bananagrams";
 
 // ===== Types =====
 type UniqueWordsMode = "disallow" | "allow_no_penalty" | "allow_with_decay";
@@ -276,11 +276,11 @@ function startRound(r: RoomState) {
       drawTiles(r, p, r.settings.bananagramsInitialDraw);
     }
 
-    // Bananagrams tick: just a timer, no drip
+    // Bananagrams tick: just a timer, no drip. Bag empty does NOT auto-end.
     r.tick && clearInterval(r.tick);
     r.tick = setInterval(() => {
       const now = Date.now();
-      if (now >= (r.endAt ?? now) || isBagEmpty(r)) {
+      if (now >= (r.endAt ?? now)) {
         clearInterval(r.tick!);
         r.tick = undefined;
         r.started = false;
@@ -423,12 +423,14 @@ function finalizeRoundWithDecay(r: RoomState) {
   emitStateToAll(r);
 }
 
-function finalizeBananagramsRound(r: RoomState) {
+function finalizeBananagramsRound(r: RoomState, bananasWinnerId?: string) {
   const final = [...r.players.values()]
     .map(p => {
       const unusedCount = countTiles(p.hand);
       const wordStrs = p.words.map(w => w.word);
-      const finalScore = scoreBananagramsGrid(wordStrs, unusedCount);
+      let finalScore = scoreBananagramsGrid(wordStrs, unusedCount);
+      // liveScore already includes BANANAS_BONUS if applicable
+      if (bananasWinnerId === p.id) finalScore += BANANAS_BONUS;
       return { id: p.id, name: p.name, finalScore };
     })
     .sort((a, b) => b.finalScore - a.finalScore);
@@ -477,9 +479,18 @@ io.on("connection", (socket: Socket) => {
       const player = r.players.get(playerId);
       if (!player) return;
       if (!/^[A-Z]+$/.test(word)) return;
-      if (word.length < r.settings.minLen) return;
-      if (!DICT.has(word)) return;
-      if (!canConsumeWord(word, player.hand)) return;
+      if (word.length < r.settings.minLen) {
+        socket.emit("word:rejected", { word, reason: "too short" });
+        return;
+      }
+      if (!DICT.has(word)) {
+        socket.emit("word:rejected", { word, reason: "not in dictionary" });
+        return;
+      }
+      if (!canConsumeWord(word, player.hand)) {
+        socket.emit("word:rejected", { word, reason: "not enough tiles" });
+        return;
+      }
 
       consumeWord(word, player.hand);
       const pts = word.length * word.length; // bananagrams scoring: length²
@@ -509,24 +520,66 @@ io.on("connection", (socket: Socket) => {
     r.pending.get(key)!.push({ ts, socketId: socket.id, playerId, word });
   });
 
-  // Bananagrams: draw more tiles from the common bag ("peel")
+  // Bananagrams: draw more tiles from the common bag ("peel") — ALL players draw
   socket.on("tiles:draw", () => {
+    if (!roomId || !playerId) return;
+    const r = rooms.get(roomId);
+    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    if (isBagEmpty(r)) return; // no tiles left
+
+    // PEEL: every player in the room draws tiles
+    for (const p of r.players.values()) {
+      drawTiles(r, p, r.settings.bananagramsDrawSize);
+    }
+    emitStateToAll(r);
+  });
+
+  // Bananagrams: dump 1 tile, draw 3 back
+  socket.on("tiles:dump", (payload: { tile: string }) => {
     if (!roomId || !playerId) return;
     const r = rooms.get(roomId);
     if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
     const player = r.players.get(playerId);
     if (!player) return;
 
-    const drawn = drawTiles(r, player, r.settings.bananagramsDrawSize);
-    if (drawn > 0) {
+    const tile = (payload.tile || "").toUpperCase();
+    if (!tile || (player.hand[tile] ?? 0) <= 0) return;
+
+    // Need at least 3 tiles in the bag
+    const available = r.bag.length - r.revealed;
+    if (available < 3) return;
+
+    // Remove tile from hand, put back in bag
+    player.hand[tile]--;
+    if (player.hand[tile] <= 0) delete player.hand[tile];
+    r.bag.push(tile); // append to end of bag
+
+    // Draw 3
+    drawTiles(r, player, 3);
+    socket.emit("lobby:state", publicState(r, socket.id));
+  });
+
+  // Bananagrams: BANANAS! — declare victory
+  socket.on("game:bananas", () => {
+    if (!roomId || !playerId) return;
+    const r = rooms.get(roomId);
+    if (!r || !r.started || r.settings.gameMode !== "bananagrams") return;
+    const player = r.players.get(playerId);
+    if (!player) return;
+
+    const handCount = countTiles(player.hand);
+    if (handCount === 0) {
+      // Valid BANANAS! — player wins with bonus
+      player.liveScore += BANANAS_BONUS;
+      clearInterval(r.tick!);
+      r.tick = undefined;
+      r.started = false;
+      finalizeBananagramsRound(r, player.id);
+    } else {
+      // Invalid — penalize and continue
+      player.liveScore = Math.max(0, player.liveScore - BANANAS_PENALTY);
+      socket.emit("word:rejected", { word: "BANANAS!", reason: `hand not empty (${handCount} tiles left) — penalty ${BANANAS_PENALTY} pts` });
       socket.emit("lobby:state", publicState(r, socket.id));
-      // If bag is now empty, end the round
-      if (isBagEmpty(r)) {
-        clearInterval(r.tick!);
-        r.tick = undefined;
-        r.started = false;
-        finalizeBananagramsRound(r);
-      }
     }
   });
 

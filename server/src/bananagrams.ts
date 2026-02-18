@@ -25,3 +25,9 @@ export function scoreBananagramsGrid(
 export function countTiles(hand: Record<string, number>): number {
   return Object.values(hand).reduce((s, n) => s + n, 0);
 }
+
+/** Bonus awarded when a player successfully calls BANANAS! */
+export const BANANAS_BONUS = 50;
+
+/** Penalty when a player calls BANANAS! but still has tiles. */
+export const BANANAS_PENALTY = 10;

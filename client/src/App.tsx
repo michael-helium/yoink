@@ -97,6 +97,8 @@ export default function App() {
   const [finals, setFinals] = useState<EndedEvt["leaderboard"] | null>(null);
   const [feed, setFeed] = useState<string[]>([]);
   const [input, setInput] = useState("");
+  const [dumpTile, setDumpTile] = useState("");
+  const [rejection, setRejection] = useState<string | null>(null);
 
   // ---- Game mode (offline) ----
   const [gameMode, setGameMode] = useState<"yoink" | "bananagrams">("yoink");
@@ -114,6 +116,7 @@ export default function App() {
   const [myWords, setMyWords] = useState<string[]>([]);
   const bagRef = useRef<string[]>([]);
   const timerRef = useRef<number | null>(null);
+  const revealedRef = useRef(0);
 
   // ---- Client-side rate limit to mirror server: 5/sec, burst 10 ----
   const bucket = useRef({ tokens: 10, last: Date.now() });
@@ -160,6 +163,10 @@ export default function App() {
       setFeed((prev) => [evt.feed, ...prev].slice(0, 10))
     );
     s.on("round:ended", (evt: EndedEvt) => setFinals(evt.leaderboard));
+    s.on("word:rejected", (evt: { word: string; reason: string }) => {
+      setRejection(`"${evt.word}" rejected: ${evt.reason}`);
+      setTimeout(() => setRejection(null), 3000);
+    });
     s.on("disconnect", () => {
       setConnected(false);
       setState(null);
@@ -180,9 +187,13 @@ export default function App() {
         for (const ch of tiles) next[ch] = (next[ch] ?? 0) + 1;
         return next;
       });
+      revealedRef.current = rev + take;
       return rev + take;
     });
   }
+
+  // Keep ref in sync
+  useEffect(() => { revealedRef.current = revealed; }, [revealed]);
 
   function startOfflineRound() {
     setFeed([]);
@@ -203,10 +214,11 @@ export default function App() {
       setHand(startHand);
       setRevealed(21);
 
+      revealedRef.current = 21;
       timerRef.current && clearInterval(timerRef.current);
       timerRef.current = window.setInterval(() => {
         setTimeLeft((t) => {
-          if (t <= 1 || bagRef.current.length <= revealed) {
+          if (t <= 1) {
             clearInterval(timerRef.current!);
             return 0;
           }
@@ -337,6 +349,47 @@ export default function App() {
     if (!connected) return;
     sockRef.current?.emit("word:submit", { word: w });
     setInput("");
+  }
+
+  // ---- BANANAS! handler ----
+  function handleBananas() {
+    if (offlineSim) {
+      const handCount = Object.values(hand).reduce((s, n) => s + n, 0);
+      if (handCount === 0) {
+        const bonus = 50;
+        const finalScore = myScore + bonus;
+        clearInterval(timerRef.current!);
+        setTimeLeft(0);
+        setFinals([{ id: "me", name, finalScore }]);
+      }
+      return;
+    }
+    sockRef.current?.emit("game:bananas");
+  }
+
+  // ---- DUMP handler ----
+  function handleDump() {
+    const tile = dumpTile.trim().toUpperCase();
+    if (!tile) return;
+    if (offlineSim) {
+      if ((hand[tile] ?? 0) <= 0) return;
+      const bag = bagRef.current;
+      const avail = bag.length - revealedRef.current;
+      if (avail < 3) return;
+      // Remove tile from hand, put back in bag
+      setHand((h) => {
+        const next = { ...h };
+        next[tile] = (next[tile] ?? 0) - 1;
+        if (next[tile]! <= 0) delete next[tile];
+        return next;
+      });
+      bagRef.current.push(tile);
+      offlineDrawTiles(3);
+      setDumpTile("");
+      return;
+    }
+    sockRef.current?.emit("tiles:dump", { tile });
+    setDumpTile("");
   }
 
   // ---- Derived UI bits ----
@@ -516,21 +569,53 @@ export default function App() {
       {/* Pool / Hand tiles */}
       <section className="px-4">
         {currentMode === "bananagrams" && (
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm text-neutral-400">Your hand ({tiles.length} tiles)</span>
+          <div className="mb-2 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-lg font-bold">🖐️ Hand: {tiles.length} tiles</span>
+              <div className="flex gap-2 items-center">
+                <button
+                  className="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold"
+                  onClick={() => {
+                    if (offlineSim) {
+                      offlineDrawTiles(3);
+                    } else {
+                      sockRef.current?.emit("tiles:draw");
+                    }
+                  }}
+                  disabled={seconds <= 0 || bagRemaining <= 0}
+                >
+                  Peel 🍌
+                </button>
+                <input
+                  className="w-10 rounded-lg bg-neutral-800 px-2 py-1 text-sm text-center outline-none uppercase"
+                  placeholder="?"
+                  maxLength={1}
+                  value={dumpTile}
+                  onChange={(e) => setDumpTile(e.target.value)}
+                />
+                <button
+                  className="rounded-lg bg-orange-600 px-3 py-1 text-sm font-semibold"
+                  onClick={handleDump}
+                  disabled={seconds <= 0 || bagRemaining < 3}
+                >
+                  Dump
+                </button>
+              </div>
+            </div>
             <button
-              className="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold"
-              onClick={() => {
-                if (offlineSim) {
-                  offlineDrawTiles(3);
-                } else {
-                  sockRef.current?.emit("tiles:draw");
-                }
-              }}
-              disabled={seconds <= 0}
+              className={`w-full rounded-xl px-4 py-3 text-lg font-bold transition-all ${
+                tiles.length === 0 && seconds > 0
+                  ? "bg-yellow-400 text-black animate-pulse"
+                  : "bg-neutral-700 text-neutral-400"
+              }`}
+              onClick={handleBananas}
+              disabled={tiles.length !== 0 || seconds <= 0}
             >
-              Draw 3 (Peel)
+              🍌 BANANAS! 🍌
             </button>
+            {offlineSim && (
+              <div className="text-xs text-amber-300">⚠️ Offline mode — no dictionary check</div>
+            )}
           </div>
         )}
         <div
@@ -609,6 +694,13 @@ export default function App() {
           ))}
         </ul>
       </section>
+
+      {/* Rejection toast */}
+      {rejection && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-semibold z-50 animate-pulse">
+          {rejection}
+        </div>
+      )}
 
       {/* Final leaderboard modal */}
       {finals && (
